@@ -63,6 +63,19 @@ CLIENT_DATASETS: Dict[int, Tuple[str, Optional[str]]] = {
     10: ("poem_sentiment", None),
 }
 
+# Candidate Hugging Face Hub repository paths for each dataset to handle
+# modern namespaces as well as legacy top-level dataset names across hub versions.
+DATASET_ALIASES: Dict[str, List[str]] = {
+    "go_emotions": ["google-research-datasets/go_emotions", "go_emotions"],
+    "tweet_eval": ["cardiffnlp/tweet_eval", "tweet_eval"],
+    "sem_eval_2018_task1": ["sem_eval_2018_task1", "SetFit/sem_eval_2018_task1"],
+    "silicone": ["silicone", "g-ronimo/silicone"],
+    "empathetic_dialogues": ["facebook/empathetic_dialogues", "empathetic_dialogues"],
+    "emo": ["emo", "monologg/emo"],
+    "xed_en_fi": ["xed_en_fi", "TartuNLP/xed_en_fi"],
+    "poem_sentiment": ["google-research-datasets/poem_sentiment", "poem_sentiment"],
+}
+
 
 # ---------------------------------------------------------------------------
 # 3. Explicit Label Mappings for Heterogeneous Datasets
@@ -502,24 +515,35 @@ def load_private_dataset(
         f"[Client {client_id}] Loading private dataset '{hf_name}' (config: {hf_config})..."
     )
 
-    try:
-        if hf_config is not None:
-            raw_data = load_dataset(hf_name, hf_config, token=config.hf_token)
-        else:
-            raw_data = load_dataset(hf_name, token=config.hf_token)
-    except Exception as e_with_token:
+    # Try candidate repository aliases (e.g. namespaced paths first, then legacy names)
+    candidate_names = DATASET_ALIASES.get(hf_name, [hf_name])
+    raw_data = None
+    last_error = None
+
+    for cand_name in candidate_names:
         try:
-            # Fallback without token in case token was invalid or unnecessary
             if hf_config is not None:
-                raw_data = load_dataset(hf_name, hf_config)
+                raw_data = load_dataset(cand_name, hf_config, token=config.hf_token)
             else:
-                raw_data = load_dataset(hf_name)
-        except Exception as e_final:
-            print(
-                f"[WARNING] Skipping Client {client_id}: Failed to load dataset '{hf_name}' "
-                f"(config: {hf_config}) from Hugging Face Hub: {e_final}"
-            )
-            return None
+                raw_data = load_dataset(cand_name, token=config.hf_token)
+            break
+        except Exception as e_with_token:
+            try:
+                # Fallback without token in case token was invalid or unneeded
+                if hf_config is not None:
+                    raw_data = load_dataset(cand_name, hf_config)
+                else:
+                    raw_data = load_dataset(cand_name)
+                break
+            except Exception as e_without_token:
+                last_error = e_without_token
+
+    if raw_data is None:
+        print(
+            f"[WARNING] Skipping Client {client_id}: Failed to load dataset '{hf_name}' "
+            f"(config: {hf_config}) from candidate Hub paths {candidate_names}: {last_error}"
+        )
+        return None
 
     # Concatenate available splits (e.g. train + validation)
     if isinstance(raw_data, dict) or hasattr(raw_data, "keys"):
