@@ -152,7 +152,8 @@ def run_client_round(
         try:
             device = next(model.parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model.head.to(device)
 
         # 4. Prepare DataLoaders
         collate_private = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)

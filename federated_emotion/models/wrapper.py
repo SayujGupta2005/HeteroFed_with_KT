@@ -294,8 +294,14 @@ class FederatedClassifier(nn.Module):
             )
             self.backbone = get_peft_model(raw_backbone, lora_config_fallback)
 
-        # Classification head: kept in FP32 and fully trainable
-        self.head = nn.Linear(self.hidden_size, self.num_labels, dtype=torch.float32)
+        # Determine backbone device
+        try:
+            device = next(raw_backbone.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        # Classification head: kept in FP32 and fully trainable on target device
+        self.head = nn.Linear(self.hidden_size, self.num_labels, dtype=torch.float32, device=device)
 
         # Ensure head parameters are explicitly marked trainable
         for p in self.head.parameters():
