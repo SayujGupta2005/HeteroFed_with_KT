@@ -531,22 +531,28 @@ def load_private_dataset(
     last_error = None
 
     for cand_name in candidate_names:
-        try:
-            if hf_config is not None:
-                raw_data = load_dataset(cand_name, hf_config, token=config.hf_token)
-            else:
-                raw_data = load_dataset(cand_name, token=config.hf_token)
-            break
-        except Exception as e_with_token:
+        # 1. Try with sub-config (if specified)
+        if hf_config is not None:
             try:
-                # Fallback without token in case token was invalid or unneeded
-                if hf_config is not None:
-                    raw_data = load_dataset(cand_name, hf_config)
-                else:
-                    raw_data = load_dataset(cand_name)
+                raw_data = load_dataset(cand_name, hf_config, token=config.hf_token)
                 break
-            except Exception as e_without_token:
-                last_error = e_without_token
+            except Exception:
+                try:
+                    raw_data = load_dataset(cand_name, hf_config)
+                    break
+                except Exception:
+                    pass
+
+        # 2. Try without sub-config (standard parquet root)
+        try:
+            raw_data = load_dataset(cand_name, token=config.hf_token)
+            break
+        except Exception:
+            try:
+                raw_data = load_dataset(cand_name)
+                break
+            except Exception as e_final:
+                last_error = e_final
 
     if raw_data is None:
         print(
