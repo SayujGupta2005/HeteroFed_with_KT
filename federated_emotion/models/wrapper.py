@@ -307,9 +307,10 @@ class FederatedClassifier(nn.Module):
 
         # Determine backbone device
         try:
-            device = next(raw_backbone.parameters()).device
+            self._device = next(raw_backbone.parameters()).device
         except StopIteration:
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = self._device
 
         # Classification head: kept in FP32 and fully trainable on target device
         self.head = nn.Linear(self.hidden_size, self.num_labels, dtype=torch.float32, device=device)
@@ -317,6 +318,11 @@ class FederatedClassifier(nn.Module):
         # Ensure head parameters are explicitly marked trainable
         for p in self.head.parameters():
             p.requires_grad = True
+
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the backbone parameters."""
+        return self._device
 
     def forward(
         self,
