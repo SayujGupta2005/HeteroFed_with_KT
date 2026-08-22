@@ -466,13 +466,70 @@ def free_model(model: Optional[Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Package Exports
+# 7. Model Pre-Loading & Verification
+# ---------------------------------------------------------------------------
+def preload_client_models(active_client_ids: List[int], config: Config) -> None:
+    """Pre-fetch, download, and verify tokenizers and model weights for all active clients before training begins.
+
+    This ensures that:
+    1. All Hugging Face model checkpoints and tokenizers are downloaded/cached upfront.
+    2. Any authentication, architecture, or network issues are caught before training begins.
+    3. Training round logs remain clean and consistent without mid-round download progress bars.
+    """
+    print("\n" + "=" * 85)
+    print("       PRE-LOADING & VERIFYING HETEROGENEOUS CLIENT BACKBONE MODELS")
+    print("=" * 85)
+
+    unique_models: Dict[str, List[int]] = {}
+    for cid in active_client_ids:
+        mid = get_model_for_client(cid)
+        if mid not in unique_models:
+            unique_models[mid] = []
+        unique_models[mid].append(cid)
+
+    total = len(unique_models)
+    for idx, (model_id, cids) in enumerate(unique_models.items(), 1):
+        clients_str = ", ".join(f"Client {c:02d}" for c in cids)
+        print(f"\n[{idx}/{total}] Pre-loading backbone: '{model_id}' (Assigned to {clients_str})...")
+        try:
+            # 1. Download & verify tokenizer
+            tokenizer = get_tokenizer(model_id, config)
+            print(f"  -> Tokenizer: OK (vocab size: {len(tokenizer)})")
+
+            # 2. Download & initialize backbone architecture in 4-bit / device_map='auto'
+            model_wrapper = FederatedClassifier(
+                model_id=model_id,
+                config=config,
+                num_classes=config.num_classes,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            print(f"  -> Model Architecture: OK ({model_wrapper.device}, hidden_size={model_wrapper.hidden_size})")
+
+            # 3. Cleanly unload from VRAM to preserve full memory for training
+            free_model(model_wrapper)
+            del tokenizer
+            gc.collect()
+            print(f"  -> Successfully verified and cached '{model_id}'.")
+        except Exception as e:
+            logger.error(f"Failed to pre-load model '{model_id}': {e}", exc_info=True)
+            print(f"  [ERROR] Failed to pre-load '{model_id}': {e}")
+            raise e
+
+    print("\n" + "=" * 85)
+    print("       ALL CLIENT MODELS SUCCESSFULLY PRE-LOADED & VERIFIED")
+    print("=" * 85 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# 8. Package Exports
 # ---------------------------------------------------------------------------
 __all__ = [
     "CLIENT_MODELS",
     "FederatedClassifier",
+    "get_model_for_client",
     "get_tokenizer",
     "save_adapter",
     "load_adapter",
     "free_model",
+    "preload_client_models",
 ]

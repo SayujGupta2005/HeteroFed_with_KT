@@ -48,7 +48,11 @@ from federated_emotion.eval_utils import (
     print_and_export_cross_dataset_matrix,
     summarize_run,
 )
-from federated_emotion.models.wrapper import CLIENT_MODELS, get_model_for_client
+from federated_emotion.models.wrapper import (
+    CLIENT_MODELS,
+    get_model_for_client,
+    preload_client_models,
+)
 from federated_emotion.server import aggregate
 
 # Configure logging
@@ -193,7 +197,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     metric_tracker = MetricTracker(log_dir=str(log_path))
 
     # 1. Load Public Datasets
-    print("[1/3] Loading Public Knowledge Distillation and Evaluation Datasets...")
+    print("[1/4] Loading Public Knowledge Distillation and Evaluation Datasets...")
     public_kd_pool, public_eval_holdout = load_public_dataset(config)
     print(
         f"  -> Public KD Pool Loaded        : {len(public_kd_pool)} instances"
@@ -203,7 +207,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     )
 
     # 2. Pre-load Client Private Datasets & Build Cross-Dataset Evaluation Suite
-    print("[2/3] Pre-loading Client Private Datasets & Slicing Holdouts...")
+    print("[2/4] Pre-loading Client Private Datasets & Slicing Holdouts...")
     private_train_datasets: Dict[int, Any] = {}
     cross_eval_datasets: Dict[str, Any] = {}
     active_clients: List[int] = []
@@ -300,8 +304,12 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
         f"{active_clients}\n"
     )
 
-    # 3. Communication Rounds Loop
-    print("[3/3] Commencing Federated Communication Rounds...\n")
+    # 3. Pre-load & Verify all Client Models Upfront
+    print("[3/4] Pre-loading & Verifying Backbone Models for All Active Clients...")
+    preload_client_models(active_clients, config)
+
+    # 4. Communication Rounds Loop
+    print("[4/4] Commencing Federated Communication Rounds...\n")
     avg_soft_labels: Optional[np.ndarray] = None
 
     for round_num in range(1, config.num_rounds + 1):
