@@ -69,6 +69,7 @@ class Config:
     hf_token_env_var: str
     private_dataset_max_size: int = 2000
     active_client_ids: Optional[List[int]] = None
+    num_classes: int = 6
 
     @property
     def hf_token(self) -> Optional[str]:
@@ -134,6 +135,7 @@ class Config:
             log_dir=str(data["log_dir"]),
             hf_token_env_var=str(data["hf_token_env_var"]),
             active_client_ids=active_clients,
+            num_classes=int(data.get("num_classes", 6)),
         )
 
     @classmethod

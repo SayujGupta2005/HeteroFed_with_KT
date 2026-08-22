@@ -497,10 +497,11 @@ def preload_client_models(active_client_ids: List[int], config: Config) -> None:
             print(f"  -> Tokenizer: OK (vocab size: {len(tokenizer)})")
 
             # 2. Download & initialize backbone architecture in 4-bit / device_map='auto'
+            num_classes = getattr(config, "num_classes", 6)
             model_wrapper = FederatedClassifier(
                 model_id=model_id,
                 config=config,
-                num_classes=config.num_classes,
+                num_classes=num_classes,
                 device="cuda" if torch.cuda.is_available() else "cpu",
             )
             print(f"  -> Model Architecture: OK ({model_wrapper.device}, hidden_size={model_wrapper.hidden_size})")
