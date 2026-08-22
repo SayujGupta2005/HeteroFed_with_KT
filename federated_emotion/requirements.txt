@@ -1,0 +1,10 @@
+torch
+transformers
+peft
+bitsandbytes
+accelerate
+datasets
+scikit-learn
+pyyaml
+tqdm
+sentencepiece

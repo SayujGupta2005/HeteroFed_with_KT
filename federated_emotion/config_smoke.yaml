@@ -1,0 +1,29 @@
+# config_smoke.yaml
+num_clients: 2
+num_rounds: 1                    # smoke test: 1 round
+local_epochs: 1                  # smoke test: 1 local epoch
+batch_size_train: 2              # small batch size to fit in 4GB GPU
+batch_size_infer: 4
+max_seq_length: 64
+learning_rate: 2e-4
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+quant_bits: 4
+
+kd_lambda: 0.5
+kd_warmup_rounds: 0              # test KD loss path
+kd_temperature: 2.0
+
+aggregation_mode: "accuracy_weighted"
+aggregation_temperature: 1.0
+
+public_kd_pool_size: 20          # smoke test: 20 examples
+public_eval_holdout_size: 10     # smoke test: 10 examples
+private_dataset_max_size: 20     # smoke test: 20 examples
+active_client_ids: [1, 2]        # smoke test: only clients 1 and 2
+
+seed_base: 42
+checkpoint_dir: "./checkpoints_smoke"
+log_dir: "./logs_smoke"
+hf_token_env_var: "HF_TOKEN"
