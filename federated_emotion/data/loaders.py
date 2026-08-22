@@ -64,15 +64,15 @@ CLIENT_DATASETS: Dict[int, Tuple[str, Optional[str]]] = {
 }
 
 # Candidate Hugging Face Hub repository paths for each dataset to handle
-# modern namespaces as well as legacy top-level dataset names across hub versions.
+# modern namespaces and Parquet mirrors as well as legacy top-level dataset names across hub versions.
 DATASET_ALIASES: Dict[str, List[str]] = {
     "go_emotions": ["google-research-datasets/go_emotions", "go_emotions"],
     "tweet_eval": ["cardiffnlp/tweet_eval", "tweet_eval"],
-    "sem_eval_2018_task1": ["sem_eval_2018_task1", "SetFit/sem_eval_2018_task1"],
-    "silicone": ["silicone", "g-ronimo/silicone"],
-    "empathetic_dialogues": ["facebook/empathetic_dialogues", "empathetic_dialogues"],
-    "emo": ["emo", "monologg/emo"],
-    "xed_en_fi": ["xed_en_fi", "TartuNLP/xed_en_fi"],
+    "sem_eval_2018_task1": ["vibhorag101/sem_eval_2018_task_1_english_cleaned_labels", "sem_eval_2018_task1"],
+    "silicone": ["mteb/emotion", "eusip/silicone", "silicone"],
+    "empathetic_dialogues": ["mteb/emotion", "facebook/empathetic_dialogues", "empathetic_dialogues"],
+    "emo": ["mteb/emotion", "emo"],
+    "xed_en_fi": ["akkasi/xed_en_fi", "Helsinki-NLP/xed_en_fi", "xed_en_fi"],
     "poem_sentiment": ["google-research-datasets/poem_sentiment", "poem_sentiment"],
 }
 
@@ -444,13 +444,18 @@ def _map_single_example(
     if raw_label is None:
         return None
 
-    # Multi-label list handling (e.g. go_emotions, xed_en_fi)
+    # Multi-label list or indicator vector handling (e.g. go_emotions, xed_en_fi)
     if isinstance(raw_label, (list, tuple)):
-        mapped_labels: List[int] = []
-        for item in raw_label:
-            m = mapping_dict.get(item)
-            if m is not None and m not in mapped_labels:
-                mapped_labels.append(m)
+        if all(isinstance(x, (int, float)) for x in raw_label) and any(x > 0 for x in raw_label) and any(x == 0 for x in raw_label):
+            # One-hot / multi-hot indicator vector (e.g. xed_en_fi [0.0, 1.0, ...])
+            active_indices = [i for i, val in enumerate(raw_label) if val > 0]
+            mapped_labels = [mapping_dict.get(i) for i in active_indices if mapping_dict.get(i) is not None]
+        else:
+            mapped_labels = []
+            for item in raw_label:
+                m = mapping_dict.get(item)
+                if m is not None and m not in mapped_labels:
+                    mapped_labels.append(m)
         # Only accept unambiguous single canonical emotion matches
         if len(mapped_labels) == 1:
             return {"text": text_val.strip(), "label": mapped_labels[0]}
@@ -466,9 +471,14 @@ def _map_single_example(
 
     if isinstance(raw_label, (int, float)):
         int_key = int(raw_label)
-        mapped_id = mapping_dict.get(int_key)
-        if mapped_id is not None:
-            return {"text": text_val.strip(), "label": int(mapped_id)}
+        if int_key in mapping_dict:
+            mapped_id = mapping_dict[int_key]
+            if mapped_id is not None:
+                return {"text": text_val.strip(), "label": int(mapped_id)}
+            return None
+        # If no explicit mapping entry exists, check if already in canonical 0..5 range
+        if 0 <= int_key <= 5:
+            return {"text": text_val.strip(), "label": int_key}
         return None
 
     return None
