@@ -33,7 +33,7 @@ from federated_emotion.data.loaders import (
 def verify_all_datasets() -> bool:
     """Run comprehensive verification across public and all 10 private datasets."""
     print("\n" + "=" * 90)
-    print("        FEDERATED EMOTION PIPELINE — DATASET HEALTH & INTEGRITY AUDIT")
+    print("        FEDERATED EMOTION PIPELINE - DATASET HEALTH & INTEGRITY AUDIT")
     print("=" * 90)
 
     config = load_config()
@@ -48,12 +48,12 @@ def verify_all_datasets() -> bool:
         kd_labels = collections.Counter(kd_pool["label"])
         eval_labels = collections.Counter(eval_holdout["label"])
 
-        print(f"  ✅ Public KD Pool       : {len(kd_pool)} instances (Target: {config.public_kd_pool_size})")
-        print(f"     Class Distribution  : {dict(sorted(kd_labels.items()))}")
-        print(f"  ✅ Public Eval Holdout  : {len(eval_holdout)} instances (Target: {config.public_eval_holdout_size})")
-        print(f"     Class Distribution  : {dict(sorted(eval_labels.items()))}")
+        print(f"  [OK] Public KD Pool       : {len(kd_pool)} instances (Target: {config.public_kd_pool_size})")
+        print(f"       Class Distribution  : {dict(sorted(kd_labels.items()))}")
+        print(f"  [OK] Public Eval Holdout  : {len(eval_holdout)} instances (Target: {config.public_eval_holdout_size})")
+        print(f"       Class Distribution  : {dict(sorted(eval_labels.items()))}")
     except Exception as e:
-        print(f"  ❌ Public Dataset FAILED: {e}")
+        print(f"  [FAIL] Public Dataset FAILED: {e}")
         all_ok = False
 
     # -----------------------------------------------------------------------
@@ -75,14 +75,14 @@ def verify_all_datasets() -> bool:
             if ds is not None and len(ds) > 0:
                 label_counts = collections.Counter(ds["label"])
                 counts_str = ", ".join(f"{c}:{label_counts.get(c, 0)}" for c in range(6))
-                status = "✅ OK"
+                status = "[OK]"
                 print(f"Client {client_id:02d} | {ds_name_trunc:<35} | {status:<10} | {len(ds):<8} | {counts_str}")
             else:
-                status = "❌ EMPTY"
+                status = "[EMPTY]"
                 all_ok = False
                 print(f"Client {client_id:02d} | {ds_name_trunc:<35} | {status:<10} | 0        | ---")
         except Exception as e:
-            status = "❌ ERROR"
+            status = "[ERROR]"
             all_ok = False
             print(f"Client {client_id:02d} | {ds_name_trunc:<35} | {status:<10} | 0        | {e}")
 
@@ -93,9 +93,9 @@ def verify_all_datasets() -> bool:
     print("=" * 90 + "\n")
 
     if all_ok:
-        print("🎉 ALL DATASETS VERIFIED SUCCESSFULLY AND READY FOR FEDERATED TRAINING!\n")
+        print("[SUCCESS] ALL DATASETS VERIFIED SUCCESSFULLY AND READY FOR FEDERATED TRAINING!\n")
     else:
-        print("⚠️ Some datasets encountered issues. Review log output above.\n")
+        print("[WARNING] Some datasets encountered issues. Review log output above.\n")
 
     return all_ok
 
