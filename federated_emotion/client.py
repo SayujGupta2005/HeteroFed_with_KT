@@ -42,6 +42,7 @@ from federated_emotion.models.wrapper import (
     CLIENT_MODELS,
     FederatedClassifier,
     free_model,
+    get_model_for_client,
     get_tokenizer,
     load_adapter,
     save_adapter,
@@ -88,36 +89,38 @@ def run_client_round(
     client_id: int,
     round_num: int,
     config: Config,
-    avg_soft_labels_from_server: Optional[Union[np.ndarray, torch.Tensor]],
     public_kd_pool: Dataset,
     public_eval_holdout: Dataset,
     private_dataset: Dataset,
+    avg_soft_labels: Optional[np.ndarray] = None,
+    avg_soft_labels_from_server: Optional[np.ndarray] = None,
+    cross_eval_datasets: Optional[Dict[str, Dataset]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Execute local training and public inference for a specific federated client round.
+    """Execute a single local training and distillation round for an active client.
 
     Args:
-        client_id: Identifier of the client (1-10 or 0-9).
-        round_num: Current communication round index (1-indexed).
-        config: Global Config dataclass instance.
-        avg_soft_labels_from_server: Aggregated consensus teacher probabilities from server,
-                                     shape [public_kd_pool_size, NUM_CLASSES].
-        public_kd_pool: Hugging Face Dataset used for Knowledge Distillation logit extraction.
+        client_id: Client identifier (1-10 or 0-9).
+        round_num: Current communication round index (1..num_rounds).
+        config: Global pipeline Config dataclass instance.
+        public_kd_pool: Public transfer dataset for logit distillation averaging.
         public_eval_holdout: Separate held-out Hugging Face Dataset for client evaluation.
         private_dataset: Local private Hugging Face Dataset with ["text", "label"].
+        avg_soft_labels: Consensus soft labels from server if KD active.
+        avg_soft_labels_from_server: Alias for avg_soft_labels.
+        cross_eval_datasets: Optional dictionary mapping dataset label names to holdout datasets.
 
     Returns:
-        Dictionary containing {"client_id": int, "logits_on_kd_pool": np.ndarray, "eval_accuracy": float}
-        or None if an error occurs during execution.
+        Dictionary containing client metrics, logits, eval accuracy, and cross-dataset matrix entries.
     """
+    if avg_soft_labels is None and avg_soft_labels_from_server is not None:
+        avg_soft_labels = avg_soft_labels_from_server
+
     model: Optional[FederatedClassifier] = None
 
     try:
         # 1. Resolve model ID and dataset metadata
-        reg_id = client_id if client_id in CLIENT_MODELS else client_id + 1
-        if reg_id not in CLIENT_MODELS:
-            raise KeyError(f"Client ID {client_id} not found in CLIENT_MODELS registry.")
-
-        model_id = CLIENT_MODELS[reg_id]
+        model_id = get_model_for_client(client_id)
+        reg_id = client_id if client_id in CLIENT_DATASETS else client_id + 1
         dataset_info = CLIENT_DATASETS.get(reg_id, ("Custom / Private", None))
         dataset_name = f"{dataset_info[0]}" + (f" ({dataset_info[1]})" if dataset_info[1] else "")
 
@@ -317,14 +320,39 @@ def run_client_round(
             f"({total_correct}/{total_eval_samples})"
         )
 
-        # 9. Save Checkpoint (Adapter + Head)
+        # 9. Cross-Dataset Evaluation across all client dataset holdouts
+        cross_eval_accuracies: Dict[str, float] = {}
+        if cross_eval_datasets:
+            with torch.no_grad():
+                for ds_key, ds_slice in cross_eval_datasets.items():
+                    if len(ds_slice) == 0:
+                        continue
+                    cross_loader = DataLoader(
+                        ds_slice,
+                        batch_size=config.batch_size_infer,
+                        shuffle=False,
+                        collate_fn=eval_collate,
+                    )
+                    c_corr = 0
+                    c_tot = 0
+                    for c_batch in cross_loader:
+                        c_in = c_batch["input_ids"].to(device)
+                        c_mask = c_batch["attention_mask"].to(device)
+                        c_lab = c_batch["label"].to(device)
+                        c_out = model(input_ids=c_in, attention_mask=c_mask)
+                        c_preds = torch.argmax(c_out, dim=-1)
+                        c_corr += (c_preds == c_lab).sum().item()
+                        c_tot += c_lab.size(0)
+                    cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
+
+        # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (
             Path(config.checkpoint_dir) / f"client_{client_id}" / f"round_{round_num}"
         )
         save_adapter(model, checkpoint_path)
         print(f"  -> Checkpoint saved to: {checkpoint_path}")
 
-        # 10. Free Model VRAM
+        # 11. Free Model VRAM
         free_model(model)
         model = None
 
@@ -332,6 +360,7 @@ def run_client_round(
             "client_id": client_id,
             "logits_on_kd_pool": logits_on_kd_pool,
             "eval_accuracy": eval_accuracy,
+            "cross_eval_accuracies": cross_eval_accuracies,
             # --- Comprehensive metrics for detailed CSV output ---
             "model_id": model_id,
             "dataset_name": dataset_name,

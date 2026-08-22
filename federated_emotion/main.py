@@ -30,9 +30,11 @@ if str(_parent_dir) not in sys.path:
 if str(_current_dir) not in sys.path:
     sys.path.insert(0, str(_current_dir))
 
+import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import torch
 
 from federated_emotion.client import run_client_round
 from federated_emotion.config import Config, load_config
@@ -41,7 +43,12 @@ from federated_emotion.data.loaders import (
     load_private_dataset,
     load_public_dataset,
 )
-from federated_emotion.eval_utils import MetricTracker, summarize_run
+from federated_emotion.eval_utils import (
+    MetricTracker,
+    print_and_export_cross_dataset_matrix,
+    summarize_run,
+)
+from federated_emotion.models.wrapper import CLIENT_MODELS, get_model_for_client
 from federated_emotion.server import aggregate
 
 # Configure logging
@@ -159,9 +166,19 @@ def _cache_client_result(
 # ---------------------------------------------------------------------------
 def run_pipeline(config: Config, resume: bool = False) -> None:
     """Execute the end-to-end federated distillation training and aggregation loop."""
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = Path("./results") / f"run_{run_timestamp}"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = Path(config.checkpoint_dir)
+    log_path = Path(config.log_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    log_path.mkdir(parents=True, exist_ok=True)
+
     print("=" * 80)
     print("       HETEROGENEOUS FEDERATED DISTILLATION PIPELINE")
     print("=" * 80)
+    print(f"Run Output Directory     : {results_dir}")
     print(f"Total Clients Configured : {config.num_clients}")
     print(f"Communication Rounds     : {config.num_rounds}")
     print(f"Local Epochs / Client    : {config.local_epochs}")
@@ -171,11 +188,6 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     print(f"Logs Path                : {config.log_dir}")
     print(f"Resume Mode              : {resume}")
     print("=" * 80 + "\n")
-
-    checkpoint_path = Path(config.checkpoint_dir)
-    log_path = Path(config.log_dir)
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-    log_path.mkdir(parents=True, exist_ok=True)
 
     # Initialize Metric Tracker
     metric_tracker = MetricTracker(log_dir=str(log_path))
@@ -190,9 +202,10 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
         f"  -> Public Eval Holdout Loaded  : {len(public_eval_holdout)} instances\n"
     )
 
-    # 2. Pre-load Client Private Datasets
-    print("[2/3] Pre-loading Client Private Datasets...")
-    private_datasets: Dict[int, Any] = {}
+    # 2. Pre-load Client Private Datasets & Build Cross-Dataset Evaluation Suite
+    print("[2/3] Pre-loading Client Private Datasets & Slicing Holdouts...")
+    private_train_datasets: Dict[int, Any] = {}
+    cross_eval_datasets: Dict[str, Any] = {}
     active_clients: List[int] = []
 
     # Map across targeted client IDs (active_client_ids if present, else 1..num_clients)
@@ -202,17 +215,85 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
         else list(range(1, config.num_clients + 1))
     )
 
+    client_manifest_entries: List[str] = []
+
     for client_id in target_client_ids:
-        ds = load_private_dataset(client_id, config)
-        if ds is not None and len(ds) > 0:
-            private_datasets[client_id] = ds
+        raw_ds = load_private_dataset(client_id, config)
+        if raw_ds is not None and len(raw_ds) > 0:
+            m_id = get_model_for_client(client_id)
+            m_short = m_id.split("/")[-1]
+            ds_info = CLIENT_DATASETS.get(client_id, ("Custom", None))
+            ds_name = ds_info[0] + (f" ({ds_info[1]})" if ds_info[1] else "")
+
+            # Extract small private holdout for cross-dataset evaluation
+            holdout_len = min(50, max(5, int(len(raw_ds) * 0.1)))
+            if len(raw_ds) > holdout_len:
+                train_slice = raw_ds.select(range(len(raw_ds) - holdout_len))
+                eval_slice = raw_ds.select(range(len(raw_ds) - holdout_len, len(raw_ds)))
+            else:
+                train_slice = raw_ds
+                eval_slice = raw_ds
+
+            private_train_datasets[client_id] = train_slice
             active_clients.append(client_id)
+
+            col_header = f"Dataset: {ds_name} [Client {client_id:02d}: {m_short}]"
+            cross_eval_datasets[col_header] = eval_slice
+            client_manifest_entries.append(
+                f"Client {client_id:02d} | Model: {m_id:<42} | Dataset: {ds_name:<30} | Train: {len(train_slice):<5} | Eval Holdout: {len(eval_slice)}"
+            )
         else:
             print(f"  [SKIPPED] Client {client_id:02d}: Dataset unavailable or empty.")
 
     if not active_clients:
         print("\n[CRITICAL ERROR] No active clients available with valid datasets. Exiting.")
         sys.exit(1)
+
+    # Also include Public Holdout in cross-dataset evaluation
+    cross_eval_datasets["Public Holdout [dair-ai/emotion]"] = public_eval_holdout
+
+    # Write run_info.txt
+    run_info_file = results_dir / "run_info.txt"
+    try:
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+        gpu_vram = f"{torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A"
+        info_lines = [
+            "=" * 85,
+            "       HETEROGENEOUS FEDERATED DISTILLATION - EXPERIMENT RUN MANIFEST",
+            "=" * 85,
+            f"Run Timestamp          : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Run Output Directory   : {results_dir.resolve()}",
+            f"Host Platform          : {sys.platform} | Python {sys.version.split()[0]} | PyTorch {torch.__version__}",
+            f"Hardware Accelerator   : {gpu_name} (Total VRAM: {gpu_vram})",
+            "",
+            "-" * 85,
+            "GLOBAL CONFIGURATION & HYPERPARAMETERS",
+            "-" * 85,
+            f"Active Clients         : {len(active_clients)} of {config.num_clients} configured",
+            f"Communication Rounds   : {config.num_rounds}",
+            f"Local Epochs / Client  : {config.local_epochs}",
+            f"Batch Size (Train/Inf) : {config.batch_size_train} / {config.batch_size_infer}",
+            f"Max Sequence Length    : {config.max_seq_length}",
+            f"Quantization           : {config.quant_bits}-bit NF4",
+            f"LoRA Hyperparameters   : Rank={config.lora_rank}, Alpha={config.lora_alpha}, Dropout={config.lora_dropout}",
+            f"Learning Rate          : {config.learning_rate}",
+            f"Knowledge Distillation : Lambda={config.kd_lambda}, Temperature={config.kd_temperature}, Warmup={config.kd_warmup_rounds} rounds",
+            f"Consensus Aggregation  : Mode={config.aggregation_mode}, Temperature={config.aggregation_temperature}",
+            f"Public KD Pool Size    : {len(public_kd_pool)}",
+            f"Public Holdout Size    : {len(public_eval_holdout)}",
+            "",
+            "-" * 85,
+            "PARTICIPATING CLIENTS & BACKBONE ARCHITECTURES",
+            "-" * 85,
+        ] + client_manifest_entries + [
+            "=" * 85,
+            "",
+        ]
+        with open(run_info_file, "w", encoding="utf-8") as f_info:
+            f_info.write("\n".join(info_lines))
+        print(f"  -> Created experiment run manifest at: {run_info_file}")
+    except Exception as e:
+        logger.warning(f"Could not write run_info.txt: {e}")
 
     print(
         f"\nActive Clients for this Run ({len(active_clients)}/{len(target_client_ids)}): "
@@ -260,7 +341,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     avg_soft_labels_from_server=avg_soft_labels,
                     public_kd_pool=public_kd_pool,
                     public_eval_holdout=public_eval_holdout,
-                    private_dataset=private_datasets[client_id],
+                    private_dataset=private_train_datasets[client_id],
+                    cross_eval_datasets=cross_eval_datasets,
                 )
 
                 if result is not None:
@@ -271,14 +353,19 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
             else:
                 print(f"[WARNING] Skipping Client {client_id:02d} for Round {round_num} aggregation.")
 
-        # Server Aggregation of Logits
+        # Server Aggregation of Logits & Cross-Dataset Matrix Computation
         if client_results:
+            # Print & Export Model x Dataset Cross-Evaluation Performance Matrix
+            print_and_export_cross_dataset_matrix(round_num, client_results, results_dir, config)
+            print_and_export_cross_dataset_matrix(round_num, client_results, log_path, config)
+
             avg_soft_labels = aggregate(client_results, config)
 
             # Persist consensus teacher soft labels
             if avg_soft_labels is not None:
                 soft_labels_path = log_path / f"round_{round_num}_avg_soft_labels.npy"
                 np.save(soft_labels_path, avg_soft_labels)
+                np.save(results_dir / f"round_{round_num}_avg_soft_labels.npy", avg_soft_labels)
                 print(f"  -> Persisted consensus teacher soft labels to: {soft_labels_path}")
 
             # Record round metrics
@@ -286,29 +373,30 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                 int(r["client_id"]): float(r["eval_accuracy"]) for r in client_results
             }
 
-            # Append to round_metrics.jsonl (one JSON line per client per round)
-            jsonl_path = log_path / "round_metrics.jsonl"
-            with open(jsonl_path, "a", encoding="utf-8") as f_jsonl:
-                for r in client_results:
-                    record = {
-                        "round": round_num,
-                        "client_id": int(r["client_id"]),
-                        "model_id": r.get("model_id", ""),
-                        "dataset_name": r.get("dataset_name", ""),
-                        "eval_accuracy": float(r["eval_accuracy"]),
-                        "eval_correct": int(r.get("eval_correct", 0)),
-                        "eval_total": int(r.get("eval_total", 0)),
-                        "avg_ce_loss": float(r.get("avg_ce_loss", 0.0)),
-                        "avg_kd_loss": float(r.get("avg_kd_loss", 0.0)),
-                        "avg_total_loss": float(r.get("avg_total_loss", 0.0)),
-                        "kd_active": bool(r.get("kd_active", False)),
-                        "num_private_examples": int(r.get("num_private_examples", 0)),
-                        "num_train_steps": int(r.get("num_train_steps", 0)),
-                        "local_epochs": int(r.get("local_epochs", 0)),
-                        "num_kd_pool": int(r.get("num_kd_pool", 0)),
-                        "num_eval_holdout": int(r.get("num_eval_holdout", 0)),
-                    }
-                    f_jsonl.write(json.dumps(record) + "\n")
+            # Append to round_metrics.jsonl
+            for target_dir in [log_path, results_dir]:
+                jsonl_path = target_dir / "round_metrics.jsonl"
+                with open(jsonl_path, "a", encoding="utf-8") as f_jsonl:
+                    for r in client_results:
+                        record = {
+                            "round": round_num,
+                            "client_id": int(r["client_id"]),
+                            "model_id": r.get("model_id", ""),
+                            "dataset_name": r.get("dataset_name", ""),
+                            "eval_accuracy": float(r["eval_accuracy"]),
+                            "eval_correct": int(r.get("eval_correct", 0)),
+                            "eval_total": int(r.get("eval_total", 0)),
+                            "avg_ce_loss": float(r.get("avg_ce_loss", 0.0)),
+                            "avg_kd_loss": float(r.get("avg_kd_loss", 0.0)),
+                            "avg_total_loss": float(r.get("avg_total_loss", 0.0)),
+                            "kd_active": bool(r.get("kd_active", False)),
+                            "num_private_examples": int(r.get("num_private_examples", 0)),
+                            "num_train_steps": int(r.get("num_train_steps", 0)),
+                            "local_epochs": int(r.get("local_epochs", 0)),
+                            "num_kd_pool": int(r.get("num_kd_pool", 0)),
+                            "num_eval_holdout": int(r.get("num_eval_holdout", 0)),
+                        }
+                        f_jsonl.write(json.dumps(record) + "\n")
 
             metric_tracker.log_round(
                 round_num=round_num,
@@ -326,7 +414,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     print("       FEDERATED TRAINING COMPLETE - GENERATING SUMMARY")
     print("=" * 80)
     metric_tracker.save_summary()
-    summarize_run(config)
+    summarize_run(config, results_dir=results_dir)
+    print(f"\n[COMPLETE] All run artifacts and manifests saved in: {results_dir.resolve()}\n")
 
 
 # ---------------------------------------------------------------------------

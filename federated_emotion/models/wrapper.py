@@ -53,17 +53,28 @@ logger = logging.getLogger(__name__)
 # 1. Heterogeneous Client Model Registry (Client IDs 1-10)
 # ---------------------------------------------------------------------------
 CLIENT_MODELS: Dict[int, str] = {
-    1: "Qwen/Qwen2.5-3B",
-    2: "Qwen/Qwen2.5-3B-Instruct",
-    3: "meta-llama/Llama-3.2-3B",
-    4: "meta-llama/Llama-3.2-3B-Instruct",
-    5: "microsoft/Phi-3.5-mini-instruct",
-    6: "stabilityai/stablelm-3b-4e1t",
-    7: "openlm-research/open_llama_3b_v2",
-    8: "togethercomputer/RedPajama-INCITE-3B-Base",
-    9: "apple/OpenELM-3B",
-    10: "Qwen/Qwen2.5-3B",
+    1: "openchat/openchat-3.5-0106",                   # Mistral 7B (Ungated)
+    2: "HuggingFaceH4/zephyr-7b-beta",                  # Mistral 7B (Ungated)
+    3: "Qwen/Qwen2.5-7B",                              # Qwen 7B
+    4: "Qwen/Qwen2.5-7B-Instruct",                     # Qwen 7B
+    5: "microsoft/Phi-3.5-mini-instruct",              # Phi 3.8B
+    6: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",      # DeepSeek 7B
+    7: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",     # DeepSeek 8B
+    8: "mistralai/Mistral-Nemo-Base-2407",             # Mistral Nemo 12B (Ungated)
+    9: "Qwen/Qwen2.5-14B",                             # Qwen 14B
+    10: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",    # DeepSeek 14B
 }
+
+DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-7B"       # Default for client IDs beyond registry (5-7B tier)
+
+
+def get_model_for_client(client_id: int) -> str:
+    """Return model identifier for client_id (1-indexed or 0-indexed), with default fallback."""
+    if client_id in CLIENT_MODELS:
+        return CLIENT_MODELS[client_id]
+    if (client_id + 1) in CLIENT_MODELS:
+        return CLIENT_MODELS[client_id + 1]
+    return DEFAULT_FALLBACK_MODEL
 
 
 # ---------------------------------------------------------------------------

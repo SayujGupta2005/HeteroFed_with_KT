@@ -31,7 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 
 from federated_emotion.config import Config
 from federated_emotion.data.loaders import CLIENT_DATASETS
-from federated_emotion.models.wrapper import CLIENT_MODELS
+from federated_emotion.models.wrapper import CLIENT_MODELS, get_model_for_client
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,10 @@ class MetricTracker:
 # ---------------------------------------------------------------------------
 # 4. Final Run Summarizer & Progress Matrix
 # ---------------------------------------------------------------------------
-def summarize_run(config: Config) -> None:
+def summarize_run(
+    config: Config,
+    results_dir: Optional[Union[str, Path]] = None,
+) -> None:
     """Read logged per-round per-client metrics, print tabular matrices, and export CSVs.
 
     Outputs:
@@ -162,9 +165,13 @@ def summarize_run(config: Config) -> None:
 
     Args:
         config: Global Config dataclass instance.
+        results_dir: Optional run results subfolder (e.g. results/run_YYYYMMDD_HHMMSS).
     """
     log_dir = Path(config.log_dir)
     checkpoint_dir = Path(config.checkpoint_dir)
+    target_out_dirs = [log_dir]
+    if results_dir is not None:
+        target_out_dirs.append(Path(results_dir))
 
     # -----------------------------------------------------------------------
     # A. Read ALL records from round_metrics.jsonl
@@ -268,7 +275,7 @@ def summarize_run(config: Config) -> None:
     summary_csv_rows: List[Dict[str, Any]] = []
 
     for cid in sorted_clients:
-        model_id = CLIENT_MODELS.get(cid, "Unknown")
+        model_id = get_model_for_client(cid)
         model_short = model_id.split("/")[-1]
         ds_info = CLIENT_DATASETS.get(cid, ("Unknown", None))
         ds_name = f"{ds_info[0]}" + (f" ({ds_info[1]})" if ds_info[1] else "")
@@ -347,26 +354,26 @@ def summarize_run(config: Config) -> None:
     table_text = "\n".join(lines)
     print(table_text)
 
-    # Write summary.csv
-    summary_csv_path = log_dir / "summary.csv"
+    # Write summary.csv to all output destinations
     summary_fieldnames = (
         ["client_id", "model_id", "dataset"]
         + [f"round_{r}_accuracy" for r in all_rounds]
         + ["net_gain_pct"]
     )
-    try:
-        with open(summary_csv_path, "w", newline="", encoding="utf-8") as f_csv:
-            writer = csv.DictWriter(f_csv, fieldnames=summary_fieldnames)
-            writer.writeheader()
-            writer.writerows(summary_csv_rows)
-        print(f"  -> Exported accuracy summary to: {summary_csv_path}")
-    except Exception as e:
-        logger.warning(f"Could not export {summary_csv_path}: {e}")
+    for out_dir in target_out_dirs:
+        summary_csv_path = out_dir / "summary.csv"
+        try:
+            with open(summary_csv_path, "w", newline="", encoding="utf-8") as f_csv:
+                writer = csv.DictWriter(f_csv, fieldnames=summary_fieldnames)
+                writer.writeheader()
+                writer.writerows(summary_csv_rows)
+            print(f"  -> Exported accuracy summary to: {summary_csv_path}")
+        except Exception as e:
+            logger.warning(f"Could not export {summary_csv_path}: {e}")
 
     # -----------------------------------------------------------------------
     # C. OUTPUT 2: Comprehensive Detailed Metrics CSV (detailed_metrics.csv)
     # -----------------------------------------------------------------------
-    detailed_csv_path = log_dir / "detailed_metrics.csv"
     detailed_fieldnames = [
         "round",
         "client_id",
@@ -399,7 +406,7 @@ def summarize_run(config: Config) -> None:
             detailed_rows.append({
                 "round": r,
                 "client_id": cid,
-                "model_id": rec.get("model_id", CLIENT_MODELS.get(cid, "")),
+                "model_id": rec.get("model_id", get_model_for_client(cid)),
                 "dataset_name": rec.get("dataset_name", ""),
                 "num_private_examples": rec.get("num_private_examples", ""),
                 "local_epochs": rec.get("local_epochs", ""),
@@ -439,13 +446,16 @@ def summarize_run(config: Config) -> None:
                 "num_eval_holdout": "",
             })
 
-    try:
-        with open(detailed_csv_path, "w", newline="", encoding="utf-8") as f_csv:
-            writer = csv.DictWriter(f_csv, fieldnames=detailed_fieldnames)
-            writer.writeheader()
-            writer.writerows(detailed_rows)
-        print(f"  -> Exported detailed metrics to: {detailed_csv_path}")
-    except Exception as e:
+    for out_dir in target_out_dirs:
+        detailed_csv_path = out_dir / "detailed_metrics.csv"
+        try:
+            with open(detailed_csv_path, "w", newline="", encoding="utf-8") as f_csv:
+                writer = csv.DictWriter(f_csv, fieldnames=detailed_fieldnames)
+                writer.writeheader()
+                writer.writerows(detailed_rows)
+            print(f"  -> Exported detailed metrics to: {detailed_csv_path}")
+        except Exception as e:
+            logger.warning(f"Could not export {detailed_csv_path}: {e}")
         logger.warning(f"Could not export {detailed_csv_path}: {e}")
 
     # -----------------------------------------------------------------------
@@ -484,12 +494,99 @@ def summarize_run(config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Package Exports
+# 5. Cross-Dataset Performance Matrix (Model × Dataset)
+# ---------------------------------------------------------------------------
+def print_and_export_cross_dataset_matrix(
+    round_num: int,
+    client_results: List[Dict[str, Any]],
+    output_dir: Union[str, Path],
+    config: Optional[Config] = None,
+) -> Optional[Path]:
+    """Format and print the Model x Dataset cross-evaluation performance matrix and export to CSV.
+
+    Rows (Left Column) : Participating Client Models (e.g. 'Client 01 (openchat-3.5-0106)')
+    Columns (Top Header): Datasets with the model they privately belong to in brackets
+                          (e.g. 'Dataset: go_emotions [Client 01: openchat-3.5-0106]')
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Collect all dataset column names across client results
+    dataset_cols: List[str] = []
+    for res in client_results:
+        cross_dict = res.get("cross_eval_accuracies", {})
+        for col_name in cross_dict.keys():
+            if col_name not in dataset_cols:
+                dataset_cols.append(col_name)
+
+    if not dataset_cols:
+        return None
+
+    # Build row dictionaries
+    matrix_rows: List[Dict[str, Any]] = []
+    for res in client_results:
+        cid = res["client_id"]
+        model_id = res.get("model_id", get_model_for_client(cid))
+        model_short = model_id.split("/")[-1]
+        row_label = f"Client {cid:02d} ({model_short})"
+        cross_dict = res.get("cross_eval_accuracies", {})
+
+        row_dict: Dict[str, Any] = {
+            "client_id": cid,
+            "model_backbone": row_label,
+        }
+        for d_col in dataset_cols:
+            acc = cross_dict.get(d_col)
+            row_dict[d_col] = round(acc * 100, 2) if acc is not None else ""
+        matrix_rows.append(row_dict)
+
+    # Print formatted matrix table
+    model_col_w = max(len("Model Backbone (Left)"), max(len(r["model_backbone"]) for r in matrix_rows)) + 2
+    col_ws = [max(len(d), 10) + 2 for d in dataset_cols]
+
+    lines = []
+    total_w = model_col_w + sum(col_ws) + len(col_ws) * 3
+    lines.append("\n" + "=" * total_w)
+    lines.append(f"        ROUND {round_num} CROSS-DATASET EVALUATION PERFORMANCE MATRIX (Model x Dataset)")
+    lines.append("=" * total_w)
+
+    hdr = f"{'Model Backbone (Left)':<{model_col_w}} | " + " | ".join(f"{d:<{w}}" for d, w in zip(dataset_cols, col_ws))
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+
+    for r in matrix_rows:
+        vals = []
+        for d, w in zip(dataset_cols, col_ws):
+            v = r.get(d, "")
+            vals.append(f"{v:.2f}%" if isinstance(v, (int, float)) else "---")
+        row_str = f"{r['model_backbone']:<{model_col_w}} | " + " | ".join(f"{v:<{w}}" for v, w in zip(vals, col_ws))
+        lines.append(row_str)
+
+    lines.append("=" * total_w + "\n")
+    print("\n".join(lines))
+
+    # Export to CSV
+    csv_file = output_path / f"cross_eval_round_{round_num}.csv"
+    try:
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["client_id", "model_backbone"] + dataset_cols)
+            writer.writeheader()
+            writer.writerows(matrix_rows)
+        print(f"  -> Exported cross-dataset matrix to: {csv_file}")
+    except Exception as e:
+        logger.warning(f"Could not export cross-dataset matrix {csv_file}: {e}")
+
+    return csv_file
+
+
+# ---------------------------------------------------------------------------
+# 6. Package Exports
 # ---------------------------------------------------------------------------
 __all__ = [
     "compute_classification_metrics",
     "compute_distillation_divergence",
     "MetricTracker",
+    "print_and_export_cross_dataset_matrix",
     "summarize_run",
 ]
 

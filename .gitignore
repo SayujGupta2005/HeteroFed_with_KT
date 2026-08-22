@@ -77,11 +77,12 @@ Desktop.ini
 .env
 .env.*
 
-# Federated Learning Checkpoints, Models, and Logs
+# Federated Learning Checkpoints, Models, Logs, and Results
 checkpoints/
 checkpoints_smoke/
 logs/
 logs_smoke/
+results/
 *.pt
 *.pth
 *.safetensors
