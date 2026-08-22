@@ -11,6 +11,8 @@ from .loaders import (
     load_public_dataset,
 )
 
+from .verify_datasets import verify_all_datasets
+
 __all__ = [
     "CANONICAL_LABELS",
     "LABEL_TO_ID",
@@ -20,4 +22,5 @@ __all__ = [
     "LABEL_MAPS",
     "load_public_dataset",
     "load_private_dataset",
+    "verify_all_datasets",
 ]
