@@ -331,6 +331,20 @@ def run_client_round(
             "client_id": client_id,
             "logits_on_kd_pool": logits_on_kd_pool,
             "eval_accuracy": eval_accuracy,
+            # --- Comprehensive metrics for detailed CSV output ---
+            "model_id": model_id,
+            "dataset_name": dataset_name,
+            "num_private_examples": len(private_dataset),
+            "num_kd_pool": len(public_kd_pool),
+            "num_eval_holdout": len(public_eval_holdout),
+            "num_train_steps": num_steps,
+            "local_epochs": config.local_epochs,
+            "avg_ce_loss": avg_ce,
+            "avg_kd_loss": avg_kd if is_kd_active else 0.0,
+            "avg_total_loss": avg_total,
+            "kd_active": is_kd_active,
+            "eval_correct": total_correct,
+            "eval_total": total_eval_samples,
         }
 
     except Exception as e:

@@ -150,15 +150,15 @@ class MetricTracker:
 # 4. Final Run Summarizer & Progress Matrix
 # ---------------------------------------------------------------------------
 def summarize_run(config: Config) -> None:
-    """Read logged per-round per-client accuracy values, print tabular matrix, and export summary.csv.
+    """Read logged per-round per-client metrics, print tabular matrices, and export CSVs.
 
-    Requirements:
-    1. Reads all logged per-round, per-client accuracy values from log_dir/round_metrics.jsonl
-       (with fallback to metrics_history.json or checkpoint metadata).
-    2. Prints a formatted table: rows = clients, columns = rounds, values = eval accuracy on public_eval_holdout.
-    3. Prints mean accuracy across active clients per round to illustrate KD group progression.
-    4. Saves this summary table as a CSV file in log_dir/summary.csv.
-    5. Uses only standard libraries (no external plotting dependencies).
+    Outputs:
+    1. **summary.csv**: Accuracy comparison matrix (rows = clients, columns = rounds)
+       with net gain and group mean row.
+    2. **detailed_metrics.csv**: Comprehensive per-client per-round CSV with all metrics:
+       model backbone, dataset, CE/KD/total loss, KD active flag, training stats,
+       eval accuracy, eval correct/total, private dataset size.
+    3. Console: Formatted tables for both outputs.
 
     Args:
         config: Global Config dataclass instance.
@@ -166,72 +166,85 @@ def summarize_run(config: Config) -> None:
     log_dir = Path(config.log_dir)
     checkpoint_dir = Path(config.checkpoint_dir)
 
-    # Dictionary structure: client_id -> {round_num: accuracy}
-    client_round_acc: Dict[int, Dict[int, float]] = {}
-    total_rounds = config.num_rounds
-
-    # 1. Read from round_metrics.jsonl
+    # -----------------------------------------------------------------------
+    # A. Read ALL records from round_metrics.jsonl
+    # -----------------------------------------------------------------------
+    all_records: List[Dict[str, Any]] = []
     jsonl_path = log_dir / "round_metrics.jsonl"
+
     if jsonl_path.exists():
         try:
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
-                        record = json.loads(line.strip())
-                        r_num = int(record["round"])
-                        c_id = int(record["client_id"])
-                        acc = float(record["eval_accuracy"])
-                        if c_id not in client_round_acc:
-                            client_round_acc[c_id] = {}
-                        client_round_acc[c_id][r_num] = acc
+                        all_records.append(json.loads(line.strip()))
         except Exception as e:
             logger.warning(f"Error reading {jsonl_path}: {e}")
 
-    # Fallback to metrics_history.json if jsonl was not populated
-    history_path = log_dir / "metrics_history.json"
-    if not client_round_acc and history_path.exists():
-        try:
-            with open(history_path, "r", encoding="utf-8") as f:
-                history_data = json.load(f)
-            for h in history_data:
-                r_num = int(h["round"])
-                c_accs = h.get("client_accuracies", {})
-                for c_id_str, acc_val in c_accs.items():
-                    c_id = int(c_id_str)
-                    if c_id not in client_round_acc:
-                        client_round_acc[c_id] = {}
-                    client_round_acc[c_id][r_num] = float(acc_val)
-        except Exception as e:
-            logger.warning(f"Error reading {history_path}: {e}")
+    # Build quick lookup: client_id -> {round_num: record}
+    client_round_data: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    for rec in all_records:
+        c_id = int(rec.get("client_id", 0))
+        r_num = int(rec.get("round", 0))
+        if c_id not in client_round_data:
+            client_round_data[c_id] = {}
+        client_round_data[c_id][r_num] = rec
+
+    # Fallback to metrics_history.json if JSONL was empty
+    if not client_round_data:
+        history_path = log_dir / "metrics_history.json"
+        if history_path.exists():
+            try:
+                with open(history_path, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+                for h in history_data:
+                    r_num = int(h["round"])
+                    c_accs = h.get("client_accuracies", {})
+                    for c_id_str, acc_val in c_accs.items():
+                        c_id = int(c_id_str)
+                        if c_id not in client_round_data:
+                            client_round_data[c_id] = {}
+                        client_round_data[c_id][r_num] = {
+                            "client_id": c_id,
+                            "round": r_num,
+                            "eval_accuracy": float(acc_val),
+                        }
+            except Exception as e:
+                logger.warning(f"Error reading {history_path}: {e}")
 
     # Fallback to scanning checkpoint directories
-    if not client_round_acc and checkpoint_dir.exists():
+    if not client_round_data and checkpoint_dir.exists():
         for c_id in range(1, config.num_clients + 1):
-            for r_num in range(1, total_rounds + 1):
+            for r_num in range(1, config.num_rounds + 1):
                 meta_path = checkpoint_dir / f"client_{c_id}" / f"round_{r_num}" / "meta.json"
                 if meta_path.exists():
                     try:
                         with open(meta_path, "r", encoding="utf-8") as f:
                             meta = json.load(f)
-                        if c_id not in client_round_acc:
-                            client_round_acc[c_id] = {}
-                        client_round_acc[c_id][r_num] = float(meta["eval_accuracy"])
+                        if c_id not in client_round_data:
+                            client_round_data[c_id] = {}
+                        client_round_data[c_id][r_num] = {
+                            "client_id": c_id,
+                            "round": r_num,
+                            "eval_accuracy": float(meta["eval_accuracy"]),
+                        }
                     except Exception:
                         pass
 
-    sorted_clients = sorted(list(client_round_acc.keys()))
+    sorted_clients = sorted(list(client_round_data.keys()))
     if not sorted_clients:
         print("[SUMMARY] No client evaluation accuracy metrics found to summarize.")
         return
 
-    # Determine unique communication rounds
     all_rounds = sorted(list(set(
-        r for c_dict in client_round_acc.values() for r in c_dict.keys()
+        r for c_dict in client_round_data.values() for r in c_dict.keys()
     )))
     if not all_rounds:
-        all_rounds = list(range(1, total_rounds + 1))
+        all_rounds = list(range(1, config.num_rounds + 1))
 
-    # 2. Build and Print Formatted Table
+    # -----------------------------------------------------------------------
+    # B. OUTPUT 1: Accuracy Comparison Matrix (summary.csv)
+    # -----------------------------------------------------------------------
     header_cols = ["Client", "Model Backbone", "Dataset"] + [f"Round {r}" for r in all_rounds] + ["Net Gain"]
     col_widths = [10, 28, 24] + [10 for _ in all_rounds] + [10]
 
@@ -252,14 +265,14 @@ def summarize_run(config: Config) -> None:
     lines.append(divider)
 
     round_client_accs: Dict[int, List[float]] = {r: [] for r in all_rounds}
-    csv_rows: List[Dict[str, Any]] = []
+    summary_csv_rows: List[Dict[str, Any]] = []
 
     for cid in sorted_clients:
         model_id = CLIENT_MODELS.get(cid, "Unknown")
         model_short = model_id.split("/")[-1]
         ds_info = CLIENT_DATASETS.get(cid, ("Unknown", None))
         ds_name = f"{ds_info[0]}" + (f" ({ds_info[1]})" if ds_info[1] else "")
-        ds_name = (ds_name[:21] + "..") if len(ds_name) > 24 else ds_name
+        ds_name_trunc = (ds_name[:21] + "..") if len(ds_name) > 24 else ds_name
 
         acc_strs = []
         acc_floats: List[Optional[float]] = []
@@ -270,34 +283,34 @@ def summarize_run(config: Config) -> None:
         }
 
         for r in all_rounds:
-            if r in client_round_acc[cid]:
-                acc = client_round_acc[cid][r]
+            rec = client_round_data.get(cid, {}).get(r)
+            if rec is not None:
+                acc = float(rec.get("eval_accuracy", 0.0))
                 acc_strs.append(f"{acc * 100:.2f}%")
                 acc_floats.append(acc)
                 round_client_accs[r].append(acc)
-                csv_row_entry[f"round_{r}"] = round(acc, 4)
+                csv_row_entry[f"round_{r}_accuracy"] = round(acc, 4)
             else:
                 acc_strs.append("N/A")
                 acc_floats.append(None)
-                csv_row_entry[f"round_{r}"] = ""
+                csv_row_entry[f"round_{r}_accuracy"] = ""
 
-        # Compute net accuracy gain (last recorded round - first recorded round)
         valid_floats = [a for a in acc_floats if a is not None]
         if len(valid_floats) >= 2:
             net_gain = (valid_floats[-1] - valid_floats[0]) * 100
             gain_str = f"{net_gain:>+6.2f}%"
-            csv_row_entry["net_gain"] = round(net_gain, 4)
+            csv_row_entry["net_gain_pct"] = round(net_gain, 4)
         else:
             gain_str = "---"
-            csv_row_entry["net_gain"] = ""
+            csv_row_entry["net_gain_pct"] = ""
 
-        row_cells = [f"Client {cid:02d}", model_short, ds_name] + acc_strs + [gain_str]
+        row_cells = [f"Client {cid:02d}", model_short, ds_name_trunc] + acc_strs + [gain_str]
         lines.append(format_row(row_cells))
-        csv_rows.append(csv_row_entry)
+        summary_csv_rows.append(csv_row_entry)
 
     lines.append(divider)
 
-    # 3. Compute and Print Mean Accuracy per Round
+    # Mean row
     mean_strs = []
     mean_floats = []
     csv_mean_entry: Dict[str, Any] = {
@@ -312,40 +325,162 @@ def summarize_run(config: Config) -> None:
             mean_acc = float(np.mean(vals))
             mean_strs.append(f"{mean_acc * 100:.2f}%")
             mean_floats.append(mean_acc)
-            csv_mean_entry[f"round_{r}"] = round(mean_acc, 4)
+            csv_mean_entry[f"round_{r}_accuracy"] = round(mean_acc, 4)
         else:
             mean_strs.append("N/A")
-            csv_mean_entry[f"round_{r}"] = ""
+            csv_mean_entry[f"round_{r}_accuracy"] = ""
 
     if len(mean_floats) >= 2:
         group_gain = (mean_floats[-1] - mean_floats[0]) * 100
         group_gain_str = f"{group_gain:>+6.2f}%"
-        csv_mean_entry["net_gain"] = round(group_gain, 4)
+        csv_mean_entry["net_gain_pct"] = round(group_gain, 4)
     else:
         group_gain_str = "---"
-        csv_mean_entry["net_gain"] = ""
+        csv_mean_entry["net_gain_pct"] = ""
 
     mean_cells = ["MEAN", "GROUP AVERAGE", "--"] + mean_strs + [group_gain_str]
     lines.append(format_row(mean_cells))
     lines.append("=" * len(table_header) + "\n")
-    csv_rows.append(csv_mean_entry)
+    summary_csv_rows.append(csv_mean_entry)
 
-    # Print summary table to console
+    # Print summary table
     table_text = "\n".join(lines)
     print(table_text)
 
-    # 4. Save Summary Table as CSV (log_dir/summary.csv)
+    # Write summary.csv
     summary_csv_path = log_dir / "summary.csv"
-    csv_fieldnames = ["client_id", "model_id", "dataset"] + [f"round_{r}" for r in all_rounds] + ["net_gain"]
-
+    summary_fieldnames = (
+        ["client_id", "model_id", "dataset"]
+        + [f"round_{r}_accuracy" for r in all_rounds]
+        + ["net_gain_pct"]
+    )
     try:
         with open(summary_csv_path, "w", newline="", encoding="utf-8") as f_csv:
-            writer = csv.DictWriter(f_csv, fieldnames=csv_fieldnames)
+            writer = csv.DictWriter(f_csv, fieldnames=summary_fieldnames)
             writer.writeheader()
-            writer.writerows(csv_rows)
-        print(f"  -> Exported CSV summary table to: {summary_csv_path}")
+            writer.writerows(summary_csv_rows)
+        print(f"  -> Exported accuracy summary to: {summary_csv_path}")
     except Exception as e:
         logger.warning(f"Could not export {summary_csv_path}: {e}")
+
+    # -----------------------------------------------------------------------
+    # C. OUTPUT 2: Comprehensive Detailed Metrics CSV (detailed_metrics.csv)
+    # -----------------------------------------------------------------------
+    detailed_csv_path = log_dir / "detailed_metrics.csv"
+    detailed_fieldnames = [
+        "round",
+        "client_id",
+        "model_id",
+        "dataset_name",
+        "num_private_examples",
+        "local_epochs",
+        "num_train_steps",
+        "avg_ce_loss",
+        "avg_kd_loss",
+        "avg_total_loss",
+        "kd_active",
+        "eval_accuracy",
+        "eval_accuracy_pct",
+        "eval_correct",
+        "eval_total",
+        "num_kd_pool",
+        "num_eval_holdout",
+    ]
+
+    detailed_rows: List[Dict[str, Any]] = []
+    for r in all_rounds:
+        round_accs = []
+        for cid in sorted_clients:
+            rec = client_round_data.get(cid, {}).get(r)
+            if rec is None:
+                continue
+            acc = float(rec.get("eval_accuracy", 0.0))
+            round_accs.append(acc)
+            detailed_rows.append({
+                "round": r,
+                "client_id": cid,
+                "model_id": rec.get("model_id", CLIENT_MODELS.get(cid, "")),
+                "dataset_name": rec.get("dataset_name", ""),
+                "num_private_examples": rec.get("num_private_examples", ""),
+                "local_epochs": rec.get("local_epochs", ""),
+                "num_train_steps": rec.get("num_train_steps", ""),
+                "avg_ce_loss": round(float(rec.get("avg_ce_loss", 0)), 6) if rec.get("avg_ce_loss") else "",
+                "avg_kd_loss": round(float(rec.get("avg_kd_loss", 0)), 6) if rec.get("avg_kd_loss") else "",
+                "avg_total_loss": round(float(rec.get("avg_total_loss", 0)), 6) if rec.get("avg_total_loss") else "",
+                "kd_active": rec.get("kd_active", ""),
+                "eval_accuracy": round(acc, 6),
+                "eval_accuracy_pct": f"{acc * 100:.2f}%",
+                "eval_correct": rec.get("eval_correct", ""),
+                "eval_total": rec.get("eval_total", ""),
+                "num_kd_pool": rec.get("num_kd_pool", ""),
+                "num_eval_holdout": rec.get("num_eval_holdout", ""),
+            })
+
+        # Add a MEAN row per round
+        if round_accs:
+            mean_acc = float(np.mean(round_accs))
+            detailed_rows.append({
+                "round": r,
+                "client_id": "MEAN",
+                "model_id": "ALL",
+                "dataset_name": "ALL",
+                "num_private_examples": "",
+                "local_epochs": "",
+                "num_train_steps": "",
+                "avg_ce_loss": "",
+                "avg_kd_loss": "",
+                "avg_total_loss": "",
+                "kd_active": "",
+                "eval_accuracy": round(mean_acc, 6),
+                "eval_accuracy_pct": f"{mean_acc * 100:.2f}%",
+                "eval_correct": "",
+                "eval_total": "",
+                "num_kd_pool": "",
+                "num_eval_holdout": "",
+            })
+
+    try:
+        with open(detailed_csv_path, "w", newline="", encoding="utf-8") as f_csv:
+            writer = csv.DictWriter(f_csv, fieldnames=detailed_fieldnames)
+            writer.writeheader()
+            writer.writerows(detailed_rows)
+        print(f"  -> Exported detailed metrics to: {detailed_csv_path}")
+    except Exception as e:
+        logger.warning(f"Could not export {detailed_csv_path}: {e}")
+
+    # -----------------------------------------------------------------------
+    # D. Print Detailed Metrics Table to Console
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 120)
+    print("        DETAILED PER-ROUND PER-CLIENT METRICS")
+    print("=" * 120)
+
+    detail_header = (
+        f"{'Round':<6} | {'Client':<10} | {'Model':<28} | {'Dataset':<22} | "
+        f"{'CE Loss':<10} | {'KD Loss':<10} | {'Total Loss':<11} | "
+        f"{'KD Active':<10} | {'Accuracy':<10} | {'Correct':<10}"
+    )
+    print(detail_header)
+    print("-" * len(detail_header))
+
+    for row in detailed_rows:
+        cid_str = str(row["client_id"])
+        model_short = str(row.get("model_id", "")).split("/")[-1][:26]
+        ds_short = str(row.get("dataset_name", ""))[:20]
+        ce = f"{row['avg_ce_loss']:.4f}" if isinstance(row.get("avg_ce_loss"), (int, float)) and row["avg_ce_loss"] != "" else "---"
+        kd = f"{row['avg_kd_loss']:.4f}" if isinstance(row.get("avg_kd_loss"), (int, float)) and row["avg_kd_loss"] != "" else "---"
+        tot = f"{row['avg_total_loss']:.4f}" if isinstance(row.get("avg_total_loss"), (int, float)) and row["avg_total_loss"] != "" else "---"
+        kd_act = str(row.get("kd_active", "---"))
+        acc_str = row.get("eval_accuracy_pct", "---")
+        correct_str = f"{row.get('eval_correct', '---')}/{row.get('eval_total', '---')}" if row.get("eval_correct") != "" else "---"
+
+        print(
+            f"{row['round']:<6} | {cid_str:<10} | {model_short:<28} | {ds_short:<22} | "
+            f"{ce:<10} | {kd:<10} | {tot:<11} | "
+            f"{kd_act:<10} | {acc_str:<10} | {correct_str:<10}"
+        )
+
+    print("=" * 120 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -357,3 +492,4 @@ __all__ = [
     "MetricTracker",
     "summarize_run",
 ]
+

@@ -293,7 +293,20 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     record = {
                         "round": round_num,
                         "client_id": int(r["client_id"]),
+                        "model_id": r.get("model_id", ""),
+                        "dataset_name": r.get("dataset_name", ""),
                         "eval_accuracy": float(r["eval_accuracy"]),
+                        "eval_correct": int(r.get("eval_correct", 0)),
+                        "eval_total": int(r.get("eval_total", 0)),
+                        "avg_ce_loss": float(r.get("avg_ce_loss", 0.0)),
+                        "avg_kd_loss": float(r.get("avg_kd_loss", 0.0)),
+                        "avg_total_loss": float(r.get("avg_total_loss", 0.0)),
+                        "kd_active": bool(r.get("kd_active", False)),
+                        "num_private_examples": int(r.get("num_private_examples", 0)),
+                        "num_train_steps": int(r.get("num_train_steps", 0)),
+                        "local_epochs": int(r.get("local_epochs", 0)),
+                        "num_kd_pool": int(r.get("num_kd_pool", 0)),
+                        "num_eval_holdout": int(r.get("num_eval_holdout", 0)),
                     }
                     f_jsonl.write(json.dumps(record) + "\n")
 

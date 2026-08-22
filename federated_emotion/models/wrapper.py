@@ -407,7 +407,7 @@ def load_adapter(
     # 2. Load classification head
     head_path = load_dir / "head.pt"
     if head_path.exists():
-        head_state = torch.load(head_path, map_location=self_or_cpu_device(model))
+        head_state = torch.load(head_path, map_location=self_or_cpu_device(model), weights_only=True)
         model.head.load_state_dict(head_state)
         logger.info(f"Loaded classification head weights from {head_path}.")
     else:
@@ -435,12 +435,8 @@ def free_model(model: Optional[Any]) -> None:
         model: Model or object reference to free.
     """
     if model is not None:
-        try:
-            # Remove any sub-module hooks or backward state if present
-            if hasattr(model, "cpu"):
-                model.cpu()
-        except Exception:
-            pass
+        # Skip .cpu() for quantized models — it triggers dequantization into RAM
+        # which can OOM on memory-constrained machines. Just del + GC is sufficient.
         del model
 
     # Trigger garbage collection

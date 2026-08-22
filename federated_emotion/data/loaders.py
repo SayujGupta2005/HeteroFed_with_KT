@@ -326,10 +326,10 @@ def load_public_dataset(config: Config) -> Tuple[Dataset, Dataset]:
     total_required = config.public_kd_pool_size + config.public_eval_holdout_size
 
     try:
-        raw_ds = load_dataset("dair-ai/emotion", token=token, trust_remote_code=True)
+        raw_ds = load_dataset("dair-ai/emotion", token=token)
     except Exception as e:
         logger.warning(f"Could not load 'dair-ai/emotion' with token; retrying without token: {e}")
-        raw_ds = load_dataset("dair-ai/emotion", trust_remote_code=True)
+        raw_ds = load_dataset("dair-ai/emotion")
 
     # Combine all available splits to form a comprehensive pool
     split_keys = [k for k in ["train", "validation", "test"] if k in raw_ds]
@@ -504,16 +504,16 @@ def load_private_dataset(
 
     try:
         if hf_config is not None:
-            raw_data = load_dataset(hf_name, hf_config, token=config.hf_token, trust_remote_code=True)
+            raw_data = load_dataset(hf_name, hf_config, token=config.hf_token)
         else:
-            raw_data = load_dataset(hf_name, token=config.hf_token, trust_remote_code=True)
+            raw_data = load_dataset(hf_name, token=config.hf_token)
     except Exception as e_with_token:
         try:
             # Fallback without token in case token was invalid or unnecessary
             if hf_config is not None:
-                raw_data = load_dataset(hf_name, hf_config, trust_remote_code=True)
+                raw_data = load_dataset(hf_name, hf_config)
             else:
-                raw_data = load_dataset(hf_name, trust_remote_code=True)
+                raw_data = load_dataset(hf_name)
         except Exception as e_final:
             print(
                 f"[WARNING] Skipping Client {client_id}: Failed to load dataset '{hf_name}' "
