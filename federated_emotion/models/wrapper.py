@@ -423,16 +423,31 @@ def load_adapter(
 
     # 1. Load LoRA adapter
     if hasattr(model, "backbone") and isinstance(model.backbone, PeftModel):
-        model.backbone.load_adapter(str(load_dir), adapter_name="default")
+        try:
+            model.backbone.load_adapter(str(load_dir), adapter_name="default")
+        except Exception as e_lora:
+            logger.warning(
+                f"Could not restore LoRA adapter weights from {load_dir} ({e_lora}). "
+                f"This commonly happens if checkpoint was saved with a different model architecture. "
+                f"Continuing with fresh base LoRA adapter."
+            )
+            print(f"  [WARNING] LoRA checkpoint shape mismatch ({e_lora}). Falling back to fresh adapter.")
     else:
         logger.warning(f"Backbone of model is not a PeftModel; skipping load_adapter for LoRA.")
 
     # 2. Load classification head
     head_path = load_dir / "head.pt"
     if head_path.exists():
-        head_state = torch.load(head_path, map_location=self_or_cpu_device(model), weights_only=True)
-        model.head.load_state_dict(head_state)
-        logger.info(f"Loaded classification head weights from {head_path}.")
+        try:
+            head_state = torch.load(head_path, map_location=self_or_cpu_device(model), weights_only=True)
+            model.head.load_state_dict(head_state)
+            logger.info(f"Loaded classification head weights from {head_path}.")
+        except Exception as e_head:
+            logger.warning(
+                f"Could not load classification head state dict from {head_path} ({e_head}). "
+                f"Continuing with newly initialized head."
+            )
+            print(f"  [WARNING] Head checkpoint shape mismatch ({e_head}). Initializing fresh head.")
     else:
         logger.warning(f"Classification head checkpoint not found at {head_path}.")
 
