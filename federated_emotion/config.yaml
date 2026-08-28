@@ -11,6 +11,15 @@ lora_alpha: 16
 lora_dropout: 0.05
 quant_bits: 4
 
+sparse_training:
+  enabled: true          # master toggle — when false, every client uses
+                           # the normal config.lora_rank value, pipeline
+                           # behaves exactly as before
+  reduced_rank: 2         # LoRA rank to use for ALL clients when enabled,
+                           # in place of the normal lora_rank (e.g. 8).
+                           # Smaller rank = fewer trainable parameters =
+                           # smaller matrices = faster forward/backward pass.
+
 kd_lambda: 0.5                   # weight of distillation loss term
 kd_warmup_rounds: 1              # rounds before KD term activates (0 = from round 1)
 kd_temperature: 2.0

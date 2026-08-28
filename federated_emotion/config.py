@@ -8,7 +8,7 @@ and resolution of Hugging Face authentication tokens from environment variables.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import yaml
@@ -42,6 +42,24 @@ REQUIRED_CONFIG_FIELDS: Set[str] = {
 
 
 @dataclass
+class SparseTrainingConfig:
+    """Configuration for sparse/reduced-rank training."""
+
+    enabled: bool = False
+    reduced_rank: int = 2
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> SparseTrainingConfig:
+        """Instantiate SparseTrainingConfig from dictionary."""
+        if not data or not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            reduced_rank=int(data.get("reduced_rank", 2)),
+        )
+
+
+@dataclass
 class Config:
     """Dataclass holding all hyperparameters and configurations for the pipeline."""
 
@@ -70,6 +88,7 @@ class Config:
     private_dataset_max_size: int = 2000
     active_client_ids: Optional[List[int]] = None
     num_classes: int = 6
+    sparse_training: SparseTrainingConfig = field(default_factory=SparseTrainingConfig)
 
     @property
     def hf_token(self) -> Optional[str]:
@@ -109,6 +128,14 @@ class Config:
         if "active_client_ids" in data and data["active_client_ids"] is not None:
             active_clients = [int(x) for x in data["active_client_ids"]]
 
+        sparse_training_raw = data.get("sparse_training")
+        if isinstance(sparse_training_raw, dict):
+            sparse_training_cfg = SparseTrainingConfig.from_dict(sparse_training_raw)
+        elif isinstance(sparse_training_raw, SparseTrainingConfig):
+            sparse_training_cfg = sparse_training_raw
+        else:
+            sparse_training_cfg = SparseTrainingConfig()
+
         # Field-type casting for safety (e.g. exponential notation strings or int-float mismatches)
         return cls(
             num_clients=int(data["num_clients"]),
@@ -136,6 +163,7 @@ class Config:
             hf_token_env_var=str(data["hf_token_env_var"]),
             active_client_ids=active_clients,
             num_classes=int(data.get("num_classes", 6)),
+            sparse_training=sparse_training_cfg,
         )
 
     @classmethod

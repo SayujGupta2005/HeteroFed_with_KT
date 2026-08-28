@@ -196,7 +196,11 @@ class FederatedClassifier(nn.Module):
         self.config = config
 
         token = config.hf_token if config else None
-        lora_r = config.lora_rank if config else 8
+        effective_rank = (
+            config.sparse_training.reduced_rank
+            if config is not None and config.sparse_training.enabled
+            else (config.lora_rank if config else 8)
+        )
         lora_alpha = config.lora_alpha if config else 16
         lora_dropout = config.lora_dropout if config else 0.05
         quant_bits = config.quant_bits if config else 4
@@ -266,7 +270,7 @@ class FederatedClassifier(nn.Module):
 
         # Wrap with PEFT LoRA adapter
         lora_config_all = LoraConfig(
-            r=lora_r,
+            r=effective_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             bias="none",
@@ -296,7 +300,7 @@ class FederatedClassifier(nn.Module):
                 "out_proj",
             ]
             lora_config_fallback = LoraConfig(
-                r=lora_r,
+                r=effective_rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 bias="none",
@@ -304,6 +308,16 @@ class FederatedClassifier(nn.Module):
                 target_modules=fallback_target_modules,
             )
             self.backbone = get_peft_model(raw_backbone, lora_config_fallback)
+
+        sparse_enabled = config.sparse_training.enabled if config is not None else False
+        logger.info(
+            f"Model '{model_id}': LoRA rank = {effective_rank} "
+            f"(sparse_training={'on' if sparse_enabled else 'off'})"
+        )
+        print(
+            f"  Model '{model_id}': LoRA rank = {effective_rank} "
+            f"(sparse_training={'on' if sparse_enabled else 'off'})"
+        )
 
         # Determine backbone device
         try:
