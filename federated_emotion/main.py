@@ -179,6 +179,16 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     checkpoint_path.mkdir(parents=True, exist_ok=True)
     log_path.mkdir(parents=True, exist_ok=True)
 
+    # Clean up stale metrics in log_path if starting fresh run (not resuming)
+    if not resume:
+        for stale_file in ["round_metrics.jsonl", "metrics_history.json"]:
+            p = log_path / stale_file
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
     print("=" * 80)
     print("       HETEROGENEOUS FEDERATED DISTILLATION PIPELINE")
     print("=" * 80)

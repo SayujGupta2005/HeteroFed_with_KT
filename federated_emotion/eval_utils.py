@@ -177,14 +177,23 @@ def summarize_run(
     # A. Read ALL records from round_metrics.jsonl
     # -----------------------------------------------------------------------
     all_records: List[Dict[str, Any]] = []
-    jsonl_path = log_dir / "round_metrics.jsonl"
+    
+    # Prefer reading from the run-specific results_dir if available
+    jsonl_path = None
+    if results_dir is not None and (Path(results_dir) / "round_metrics.jsonl").exists():
+        jsonl_path = Path(results_dir) / "round_metrics.jsonl"
+    elif (log_dir / "round_metrics.jsonl").exists():
+        jsonl_path = log_dir / "round_metrics.jsonl"
 
-    if jsonl_path.exists():
+    if jsonl_path is not None and jsonl_path.exists():
         try:
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
-                        all_records.append(json.loads(line.strip()))
+                        rec = json.loads(line.strip())
+                        r_val = int(rec.get("round", 0))
+                        if 1 <= r_val <= config.num_rounds:
+                            all_records.append(rec)
         except Exception as e:
             logger.warning(f"Error reading {jsonl_path}: {e}")
 
@@ -199,13 +208,20 @@ def summarize_run(
 
     # Fallback to metrics_history.json if JSONL was empty
     if not client_round_data:
-        history_path = log_dir / "metrics_history.json"
-        if history_path.exists():
+        history_path = None
+        if results_dir is not None and (Path(results_dir) / "metrics_history.json").exists():
+            history_path = Path(results_dir) / "metrics_history.json"
+        elif (log_dir / "metrics_history.json").exists():
+            history_path = log_dir / "metrics_history.json"
+
+        if history_path is not None and history_path.exists():
             try:
                 with open(history_path, "r", encoding="utf-8") as f:
                     history_data = json.load(f)
                 for h in history_data:
                     r_num = int(h["round"])
+                    if not (1 <= r_num <= config.num_rounds):
+                        continue
                     c_accs = h.get("client_accuracies", {})
                     for c_id_str, acc_val in c_accs.items():
                         c_id = int(c_id_str)
@@ -245,6 +261,7 @@ def summarize_run(
 
     all_rounds = sorted(list(set(
         r for c_dict in client_round_data.values() for r in c_dict.keys()
+        if 1 <= r <= config.num_rounds
     )))
     if not all_rounds:
         all_rounds = list(range(1, config.num_rounds + 1))
@@ -456,7 +473,6 @@ def summarize_run(
             print(f"  -> Exported detailed metrics to: {detailed_csv_path}")
         except Exception as e:
             logger.warning(f"Could not export {detailed_csv_path}: {e}")
-        logger.warning(f"Could not export {detailed_csv_path}: {e}")
 
     # -----------------------------------------------------------------------
     # D. Print Detailed Metrics Table to Console
