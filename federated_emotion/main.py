@@ -38,6 +38,7 @@ import torch
 
 from federated_emotion.client import run_client_round
 from federated_emotion.config import Config, load_config
+from federated_emotion.profiler import global_profiler
 from federated_emotion.data.loaders import (
     CLIENT_DATASETS,
     load_private_dataset,
@@ -208,7 +209,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
     # 1. Load Public Datasets
     print("[1/4] Loading Public Knowledge Distillation and Evaluation Datasets...")
+    global_profiler.start("Server_Load_Public_Data")
     public_kd_pool, public_eval_holdout = load_public_dataset(config)
+    global_profiler.stop("Server_Load_Public_Data")
     print(
         f"  -> Public KD Pool Loaded        : {len(public_kd_pool)} instances"
     )
@@ -232,7 +235,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     client_manifest_entries: List[str] = []
 
     for client_id in target_client_ids:
+        global_profiler.start("Server_Load_Private_Data")
         raw_ds = load_private_dataset(client_id, config)
+        global_profiler.stop("Server_Load_Private_Data")
         if raw_ds is not None and len(raw_ds) > 0:
             m_id = get_model_for_client(client_id)
             m_short = m_id.split("/")[-1]
@@ -315,8 +320,11 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     )
 
     # 3. Pre-load & Verify all Client Models Upfront
-    print("[3/4] Pre-loading & Verifying Backbone Models for All Active Clients...")
-    preload_client_models(active_clients, config)
+    print("[3/4] Pre-loading & Verify all Client Models Upfront")
+    if config.preload_models and len(active_clients) > 0:
+        global_profiler.start("Server_Model_Preloading")
+        preload_client_models(active_clients, config)
+        global_profiler.stop("Server_Model_Preloading")
 
     # 4. Communication Rounds Loop
     print("[4/4] Commencing Federated Communication Rounds...\n")
@@ -352,6 +360,15 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     result = cached_res
 
             if result is None:
+                # Optimize evaluation: only check against all datasets on the final round
+                if round_num == config.num_rounds:
+                    current_cross_eval = cross_eval_datasets
+                else:
+                    current_cross_eval = {}
+                    for k, v in cross_eval_datasets.items():
+                        if f"[Client {client_id:02d}:" in k or k == "Public Holdout [dair-ai/emotion]":
+                            current_cross_eval[k] = v
+
                 result = run_client_round(
                     client_id=client_id,
                     round_num=round_num,
@@ -360,7 +377,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     public_kd_pool=public_kd_pool,
                     public_eval_holdout=public_eval_holdout,
                     private_dataset=private_train_datasets[client_id],
-                    cross_eval_datasets=cross_eval_datasets,
+                    cross_eval_datasets=current_cross_eval,
                 )
 
                 if result is not None:
@@ -373,6 +390,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
         # Server Aggregation of Logits & Cross-Dataset Matrix Computation
         if client_results:
+            global_profiler.start("Server_Aggregation")
             # Print & Export Model x Dataset Cross-Evaluation Performance Matrix
             print_and_export_cross_dataset_matrix(round_num, client_results, results_dir, config)
             print_and_export_cross_dataset_matrix(round_num, client_results, log_path, config)
@@ -385,6 +403,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                 np.save(soft_labels_path, avg_soft_labels)
                 np.save(results_dir / f"round_{round_num}_avg_soft_labels.npy", avg_soft_labels)
                 print(f"  -> Persisted consensus teacher soft labels to: {soft_labels_path}")
+            
+            global_profiler.stop("Server_Aggregation")
 
             # Record round metrics
             round_accuracies = {
@@ -433,6 +453,10 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     print("=" * 80)
     metric_tracker.save_summary()
     summarize_run(config, results_dir=results_dir)
+    
+    # Save execution time profiler summary
+    global_profiler.save_summary(results_dir / "timing_summary.json")
+    
     print(f"\n[COMPLETE] All run artifacts and manifests saved in: {results_dir.resolve()}\n")
 
 

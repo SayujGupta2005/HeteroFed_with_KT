@@ -36,6 +36,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset
 
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
+from federated_emotion.profiler import global_profiler
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
 from federated_emotion.config import Config
 from federated_emotion.data.loaders import CLIENT_DATASETS, NUM_CLASSES
 from federated_emotion.models.wrapper import (
@@ -83,7 +96,98 @@ def _create_collate_fn(tokenizer: Any, max_length: int, include_idx: bool = Fals
 
 
 # ---------------------------------------------------------------------------
-# 2. Main Client Execution Function
+# 2. Wanda Calibration (On-the-fly Sparsity)
+# ---------------------------------------------------------------------------
+def _apply_wanda(model: nn.Module, dataloader: DataLoader, device: torch.device, num_samples: int = 128) -> None:
+    """Applies Wanda (Weight and Activation) 2:4 structured sparsity on the fly.
+    Uses the private dataset to calibrate activation norms."""
+    print(f"  -> Calibrating Wanda 2:4 Sparsity on {num_samples} private samples...")
+    model.eval()
+    
+    # 1. Find target linear layers (base layers inside LoRA)
+    target_layers = {}
+    for name, module in model.named_modules():
+        # Look for standard Linear or PEFT base_layer
+        if isinstance(module, nn.Linear):
+            target_layers[name] = module
+        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
+            target_layers[name] = module.base_layer
+
+    if not target_layers:
+        print("     [WARNING] No compatible linear layers found for Wanda.")
+        return
+
+    # 2. Register forward hooks to capture input activation norms
+    activation_norms = {}
+    hooks = []
+
+    def get_activation_hook(name):
+        def hook(module, inp, out):
+            x = inp[0].detach()
+            x = x.view(-1, x.shape[-1])
+            norm = torch.norm(x, p=2, dim=0)
+            if name in activation_norms:
+                activation_norms[name] += norm.pow(2)
+            else:
+                activation_norms[name] = norm.pow(2)
+        return hook
+
+    for name, layer in target_layers.items():
+        hooks.append(layer.register_forward_hook(get_activation_hook(name)))
+
+    # 3. Forward pass to calibrate
+    samples_processed = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            if samples_processed >= num_samples:
+                break
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            model(input_ids=input_ids, attention_mask=attention_mask)
+            samples_processed += input_ids.size(0)
+
+    for h in hooks:
+        h.remove()
+
+    # 4. Compute Wanda metric and apply 2:4 mask
+    pruned_count = 0
+    total_count = 0
+    
+    with torch.no_grad():
+        for name, layer in target_layers.items():
+            if name not in activation_norms:
+                continue
+            x_norm = torch.sqrt(activation_norms[name])
+            try:
+                if hasattr(layer.weight, "quant_state"):
+                    print(f"     [WARNING] Skipping quantized layer {name} for direct Wanda masking.")
+                    continue
+                W = layer.weight.data
+                if W.dim() != 2: continue
+                out_feat, in_feat = W.shape
+                if in_feat % 4 != 0: continue
+                
+                wanda_metric = torch.abs(W) * x_norm.unsqueeze(0)
+                w_reshaped = wanda_metric.view(out_feat, -1, 4)
+                _, indices = torch.topk(w_reshaped, k=2, dim=-1, largest=False)
+                
+                mask = torch.ones_like(w_reshaped, dtype=torch.bool)
+                mask.scatter_(dim=-1, index=indices, value=False)
+                mask = mask.view(out_feat, in_feat)
+                
+                W.mul_(mask)
+                pruned_count += (mask == False).sum().item()
+                total_count += W.numel()
+            except Exception as e:
+                logger.warning(f"Failed to apply Wanda to {name}: {e}")
+
+    if total_count > 0:
+        print(f"  -> Wanda Calibration Complete. Backbone Sparsity: {(pruned_count / total_count) * 100:.1f}%")
+    else:
+        print("  -> Wanda Calibration skipped (likely due to 4-bit quantized backbone).")
+
+# ---------------------------------------------------------------------------
+# 3. Main Client Execution Function
 # ---------------------------------------------------------------------------
 def run_client_round(
     client_id: int,
@@ -96,22 +200,7 @@ def run_client_round(
     avg_soft_labels_from_server: Optional[np.ndarray] = None,
     cross_eval_datasets: Optional[Dict[str, Dataset]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Execute a single local training and distillation round for an active client.
-
-    Args:
-        client_id: Client identifier (1-10 or 0-9).
-        round_num: Current communication round index (1..num_rounds).
-        config: Global pipeline Config dataclass instance.
-        public_kd_pool: Public transfer dataset for logit distillation averaging.
-        public_eval_holdout: Separate held-out Hugging Face Dataset for client evaluation.
-        private_dataset: Local private Hugging Face Dataset with ["text", "label"].
-        avg_soft_labels: Consensus soft labels from server if KD active.
-        avg_soft_labels_from_server: Alias for avg_soft_labels.
-        cross_eval_datasets: Optional dictionary mapping dataset label names to holdout datasets.
-
-    Returns:
-        Dictionary containing client metrics, logits, eval accuracy, and cross-dataset matrix entries.
-    """
+    """Execute a single local training and distillation round for an active client."""
     if avg_soft_labels is None and avg_soft_labels_from_server is not None:
         avg_soft_labels = avg_soft_labels_from_server
 
@@ -186,9 +275,20 @@ def run_client_round(
         if not trainable_params:
             raise ValueError(f"No trainable parameters found in model for client {client_id}.")
 
-        optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+        if HAS_BNB:
+            optimizer = bnb.optim.AdamW8bit(trainable_params, lr=config.learning_rate)
+            print(f"  -> Optimizer: bitsandbytes 8-bit AdamW")
+        else:
+            optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+            print(f"  -> Optimizer: Standard AdamW (bitsandbytes not found)")
+
         ce_loss_fn = nn.CrossEntropyLoss()
         kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+        
+        # Apply Wanda on the fly
+        global_profiler.start(f"Client_Wanda_Calibration")
+        _apply_wanda(model, train_loader, device, num_samples=128)
+        global_profiler.stop(f"Client_Wanda_Calibration")
 
         # Knowledge Distillation state
         is_kd_active = (
@@ -213,6 +313,7 @@ def run_client_round(
             print("  -> Knowledge Distillation INACTIVE (Warmup phase or round 1)")
 
         # 6. Local Training Epochs
+        global_profiler.start(f"Client_Local_Training")
         model.train()
         for epoch in range(1, config.local_epochs + 1):
             total_ce_loss = 0.0
@@ -270,7 +371,10 @@ def run_client_round(
                 + (f" | KD: {avg_kd:.4f}" if is_kd_active else "")
             )
 
+        global_profiler.stop(f"Client_Local_Training")
+
         # 7. Post-Training Inference on Public KD Pool (no_grad)
+        global_profiler.start(f"Client_KD_Inference")
         model.eval()
         print("  -> Generating client logits over public KD pool...")
         infer_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
@@ -290,8 +394,10 @@ def run_client_round(
                 kd_logits_list.append(logits.detach().cpu().to(torch.float32).numpy())
 
         logits_on_kd_pool: np.ndarray = np.concatenate(kd_logits_list, axis=0)
+        global_profiler.stop(f"Client_KD_Inference")
 
         # 8. Client Evaluation on Public Eval Holdout
+        global_profiler.start(f"Client_Local_Eval")
         print("  -> Evaluating on public eval holdout...")
         eval_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
         eval_loader = DataLoader(
@@ -319,8 +425,10 @@ def run_client_round(
             f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% "
             f"({total_correct}/{total_eval_samples})"
         )
+        global_profiler.stop(f"Client_Local_Eval")
 
         # 9. Cross-Dataset Evaluation across all client dataset holdouts
+        global_profiler.start(f"Client_Cross_Eval")
         cross_eval_accuracies: Dict[str, float] = {}
         if cross_eval_datasets:
             with torch.no_grad():
@@ -344,6 +452,8 @@ def run_client_round(
                         c_corr += (c_preds == c_lab).sum().item()
                         c_tot += c_lab.size(0)
                     cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
+        
+        global_profiler.stop(f"Client_Cross_Eval")
 
         # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (

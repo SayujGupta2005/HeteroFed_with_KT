@@ -2,7 +2,7 @@
 
 Executes a complete health check across:
 1. Public reference dataset (dair-ai/emotion) for KD pool and holdout evaluation.
-2. All 10 client private datasets (1-10) with canonical 6-class label distribution audits.
+2. All 9 client private datasets (1-9) with canonical 6-class label distribution audits.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from federated_emotion.data.loaders import (
 
 
 def verify_all_datasets() -> bool:
-    """Run comprehensive verification across public and all 10 private datasets."""
+    """Run comprehensive verification across public and all 9 private datasets."""
     print("\n" + "=" * 90)
     print("        FEDERATED EMOTION PIPELINE - DATASET HEALTH & INTEGRITY AUDIT")
     print("=" * 90)
@@ -57,15 +57,15 @@ def verify_all_datasets() -> bool:
         all_ok = False
 
     # -----------------------------------------------------------------------
-    # 2. Audit All 10 Client Private Datasets
+    # 2. Audit All 9 Client Private Datasets
     # -----------------------------------------------------------------------
-    print("\n[2/2] Auditing 10 Private Client Datasets...")
+    print("\n[2/2] Auditing 9 Private Client Datasets...")
     print("-" * 90)
     header = f"{'Client':<8} | {'Dataset (Config)':<35} | {'Status':<10} | {'Samples':<8} | {'Class Breakdown (0-5)'}"
     print(header)
     print("-" * 90)
 
-    for client_id in range(1, 11):
+    for client_id in range(1, 10):
         hf_name, hf_config = CLIENT_DATASETS[client_id]
         ds_name = f"{hf_name}" + (f" ({hf_config})" if hf_config else "")
         ds_name_trunc = (ds_name[:32] + "..") if len(ds_name) > 35 else ds_name

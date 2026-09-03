@@ -6,7 +6,7 @@ batch_size_train: 2              # small batch size to fit in 4GB GPU
 batch_size_infer: 4
 max_seq_length: 64
 learning_rate: 2e-4
-lora_rank: 8
+lora_rank: 2
 lora_alpha: 16
 lora_dropout: 0.05
 quant_bits: 4

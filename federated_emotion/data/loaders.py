@@ -3,7 +3,7 @@
 This module provides:
 1. CANONICAL_LABELS taxonomy (6 classes matching dair-ai/emotion).
 2. Public dataset loader for Knowledge Distillation (KD) pool and evaluation holdout.
-3. Explicit label mappings (LABEL_MAPS) harmonizing 10 heterogeneous emotion datasets.
+3. Explicit label mappings (LABEL_MAPS) harmonizing 9 heterogeneous emotion datasets.
 4. Client dataset loader (load_private_dataset) with error tolerance, filtering,
    and configurable max dataset size capping.
 """
@@ -48,7 +48,7 @@ NUM_CLASSES: int = len(CANONICAL_LABELS)  # 6
 
 
 # ---------------------------------------------------------------------------
-# 2. Client Datasets Registry (Client IDs 1-10)
+# 2. Client Datasets Registry (Client IDs 1-9)
 # ---------------------------------------------------------------------------
 CLIENT_DATASETS: Dict[int, Tuple[str, Optional[str]]] = {
     1: ("go_emotions", "simplified"),
@@ -60,7 +60,6 @@ CLIENT_DATASETS: Dict[int, Tuple[str, Optional[str]]] = {
     7: ("empathetic_dialogues", None),
     8: ("emo", None),
     9: ("xed_en_fi", "en_annotated"),
-    10: ("poem_sentiment", None),
 }
 
 # Candidate Hugging Face Hub repository paths for each dataset to handle
@@ -73,7 +72,6 @@ DATASET_ALIASES: Dict[str, List[str]] = {
     "empathetic_dialogues": ["mteb/emotion", "facebook/empathetic_dialogues", "empathetic_dialogues"],
     "emo": ["mteb/emotion", "emo"],
     "xed_en_fi": ["akkasi/xed_en_fi", "Helsinki-NLP/xed_en_fi", "xed_en_fi"],
-    "poem_sentiment": ["google-research-datasets/poem_sentiment", "poem_sentiment"],
 }
 
 
@@ -300,21 +298,6 @@ LABEL_MAPS: Dict[str, Dict[Union[str, int], Optional[int]]] = {
         "surprise": LABEL_TO_ID["surprise"],
         "trust": None,
     },
-
-    # 10. poem_sentiment: 0: negative, 1: positive, 2: no_impact, 3: mixed
-    # NOTE: poem_sentiment is a sentiment dataset without fine-grained emotion labels.
-    # We apply a rough proxy mapping: positive -> joy (1), negative -> sadness (0),
-    # dropping ambiguous categories (no_impact, mixed).
-    "poem_sentiment": {
-        0: LABEL_TO_ID["sadness"],          # negative -> sadness proxy (0)
-        1: LABEL_TO_ID["joy"],              # positive -> joy proxy (1)
-        2: None,                            # no_impact
-        3: None,                            # mixed
-        "negative": LABEL_TO_ID["sadness"],
-        "positive": LABEL_TO_ID["joy"],
-        "no_impact": None,
-        "mixed": None,
-    },
 }
 
 
@@ -493,18 +476,18 @@ def load_private_dataset(
 ) -> Optional[Dataset]:
     """Load, harmonize, filter, and cap a private dataset for a federated client.
 
-    Maps client_id (1-10) to the corresponding dataset via CLIENT_DATASETS,
+    Maps client_id (1-9) to the corresponding dataset via CLIENT_DATASETS,
     applies explicit LABEL_MAPS to drop non-canonical examples, and caps dataset size
     at config.private_dataset_max_size.
 
     Args:
-        client_id: Client identifier (supports 1-10 as well as 0-9 index).
+        client_id: Client identifier (supports 1-9 as well as 0-8 index).
         config: Global Config dataclass instance.
 
     Returns:
         Hugging Face Dataset with columns ["text", "label"] (int 0-5), or None if loading fails.
     """
-    # Normalize client_id to 1-10 registry
+    # Normalize client_id to 1-9 registry
     reg_id = client_id
     if reg_id not in CLIENT_DATASETS:
         if (client_id + 1) in CLIENT_DATASETS:

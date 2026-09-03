@@ -2,7 +2,7 @@
 mean pooling, and trainable classification heads for federated learning.
 
 This module provides:
-1. CLIENT_MODELS registry mapping client IDs 1-10 to heterogeneous 3B LLM backbones.
+1. CLIENT_MODELS registry mapping client IDs 1-9 to heterogeneous 3B LLM backbones.
 2. FederatedClassifier nn.Module combining 4-bit NF4 quantized backbone, LoRA adapters,
    mean pooling, and FP32 classification head.
 3. get_tokenizer helper handling architecture-specific tokenizers (including OpenELM).
@@ -50,7 +50,7 @@ from federated_emotion.config import Config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 1. Heterogeneous Client Model Registry (Client IDs 1-10)
+# 1. Heterogeneous Client Model Registry (Client IDs 1-9)
 # ---------------------------------------------------------------------------
 CLIENT_MODELS: Dict[int, str] = {
     1: "openchat/openchat-3.5-0106",                   # Mistral 7B (Ungated)
@@ -62,7 +62,6 @@ CLIENT_MODELS: Dict[int, str] = {
     7: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",     # DeepSeek 8B
     8: "mistralai/Mistral-Nemo-Base-2407",             # Mistral Nemo 12B (Ungated)
     9: "Qwen/Qwen2.5-14B",                             # Qwen 14B
-    10: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",    # DeepSeek 14B
 }
 
 DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-7B"       # Default for client IDs beyond registry (5-7B tier)
@@ -252,18 +251,33 @@ class FederatedClassifier(nn.Module):
                 dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
                 trust_remote_code=True,
                 token=token,
+                attn_implementation="flash_attention_2",
             )
+            logger.info(f"Loaded '{model_id}' with flash_attention_2.")
         except Exception as e:
             logger.warning(
-                f"AutoModel.from_pretrained failed for '{model_id}' ({e}); attempting fallback without quantization..."
+                f"AutoModel.from_pretrained with flash_attention_2 failed for '{model_id}' ({e}); attempting fallback..."
             )
-            raw_backbone = AutoModel.from_pretrained(
-                model_id,
-                device_map="auto" if torch.cuda.is_available() else None,
-                dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-                trust_remote_code=True,
-                token=token,
-            )
+            try:
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
+            except Exception as e_inner:
+                logger.warning(
+                    f"AutoModel.from_pretrained failed for '{model_id}' ({e_inner}); attempting fallback without quantization..."
+                )
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
 
         # Dynamic hidden size resolution
         self.hidden_size = _extract_hidden_size(raw_backbone.config)

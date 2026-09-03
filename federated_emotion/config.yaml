@@ -1,7 +1,7 @@
 # config.yaml
-num_clients: 10
-num_rounds: 3                    # configurable
-local_epochs: 2                  # configurable
+num_clients: 9
+num_rounds: 5                    # configurable
+local_epochs: 3                  # configurable
 batch_size_train: 8
 batch_size_infer: 16
 max_seq_length: 128
