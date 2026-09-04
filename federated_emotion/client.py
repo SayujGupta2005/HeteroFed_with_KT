@@ -315,6 +315,9 @@ def run_client_round(
         # 6. Local Training Epochs
         global_profiler.start(f"Client_Local_Training")
         model.train()
+        
+        from tqdm import tqdm
+        
         for epoch in range(1, config.local_epochs + 1):
             total_ce_loss = 0.0
             total_kd_loss = 0.0
@@ -323,8 +326,10 @@ def run_client_round(
 
             # Interleave private batches with KD batches
             kd_iter = itertools.cycle(kd_loader) if is_kd_active else None
+            
+            pbar = tqdm(train_loader, desc=f"  Epoch [{epoch:02d}/{config.local_epochs:02d}]", leave=False)
 
-            for batch_priv in train_loader:
+            for batch_priv in pbar:
                 optimizer.zero_grad()
 
                 # A. Supervised Task Loss

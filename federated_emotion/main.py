@@ -321,7 +321,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
     # 3. Pre-load & Verify all Client Models Upfront
     print("[3/4] Pre-loading & Verify all Client Models Upfront")
-    if config.preload_models and len(active_clients) > 0:
+    if len(active_clients) > 0:
         global_profiler.start("Server_Model_Preloading")
         preload_client_models(active_clients, config)
         global_profiler.stop("Server_Model_Preloading")
