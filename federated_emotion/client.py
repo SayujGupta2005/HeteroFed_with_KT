@@ -35,7 +35,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset
+from tqdm import tqdm
 
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
+from federated_emotion.profiler import global_profiler
 from federated_emotion.config import Config
 from federated_emotion.data.loaders import CLIENT_DATASETS, NUM_CLASSES
 from federated_emotion.models.wrapper import (
@@ -186,7 +194,19 @@ def run_client_round(
         if not trainable_params:
             raise ValueError(f"No trainable parameters found in model for client {client_id}.")
 
-        optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+        use_8bit = getattr(config, "optimizer_8bit", True) and HAS_BNB
+        if use_8bit:
+            try:
+                optimizer = bnb.optim.AdamW8bit(trainable_params, lr=config.learning_rate)
+                print(f"  -> Optimizer: bitsandbytes 8-bit AdamW")
+            except Exception as e_bnb:
+                logger.warning(f"Could not initialize 8-bit AdamW ({e_bnb}); falling back to torch.optim.AdamW")
+                optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+                print(f"  -> Optimizer: Standard AdamW (fallback due to {e_bnb})")
+        else:
+            optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+            print("  -> Optimizer: Standard AdamW" + (" (bitsandbytes not found)" if not HAS_BNB else ""))
+
         ce_loss_fn = nn.CrossEntropyLoss()
         kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
 
@@ -213,6 +233,7 @@ def run_client_round(
             print("  -> Knowledge Distillation INACTIVE (Warmup phase or round 1)")
 
         # 6. Local Training Epochs
+        global_profiler.start("Client_Local_Training")
         model.train()
         for epoch in range(1, config.local_epochs + 1):
             total_ce_loss = 0.0
@@ -223,7 +244,8 @@ def run_client_round(
             # Interleave private batches with KD batches
             kd_iter = itertools.cycle(kd_loader) if is_kd_active else None
 
-            for batch_priv in train_loader:
+            pbar = tqdm(train_loader, desc=f"  Epoch [{epoch:02d}/{config.local_epochs:02d}]", leave=False)
+            for batch_priv in pbar:
                 optimizer.zero_grad()
 
                 # A. Supervised Task Loss
@@ -269,8 +291,10 @@ def run_client_round(
                 f"Loss Total: {avg_total:.4f} | CE: {avg_ce:.4f}"
                 + (f" | KD: {avg_kd:.4f}" if is_kd_active else "")
             )
+        global_profiler.stop("Client_Local_Training")
 
         # 7. Post-Training Inference on Public KD Pool (no_grad)
+        global_profiler.start("Client_KD_Inference")
         model.eval()
         print("  -> Generating client logits over public KD pool...")
         infer_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
@@ -290,8 +314,10 @@ def run_client_round(
                 kd_logits_list.append(logits.detach().cpu().to(torch.float32).numpy())
 
         logits_on_kd_pool: np.ndarray = np.concatenate(kd_logits_list, axis=0)
+        global_profiler.stop("Client_KD_Inference")
 
         # 8. Client Evaluation on Public Eval Holdout
+        global_profiler.start("Client_Local_Eval")
         print("  -> Evaluating on public eval holdout...")
         eval_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
         eval_loader = DataLoader(
@@ -319,10 +345,12 @@ def run_client_round(
             f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% "
             f"({total_correct}/{total_eval_samples})"
         )
+        global_profiler.stop("Client_Local_Eval")
 
         # 9. Cross-Dataset Evaluation across all client dataset holdouts
         cross_eval_accuracies: Dict[str, float] = {}
         if cross_eval_datasets:
+            global_profiler.start("Client_Cross_Eval")
             with torch.no_grad():
                 for ds_key, ds_slice in cross_eval_datasets.items():
                     if len(ds_slice) == 0:
@@ -344,6 +372,7 @@ def run_client_round(
                         c_corr += (c_preds == c_lab).sum().item()
                         c_tot += c_lab.size(0)
                     cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
+            global_profiler.stop("Client_Cross_Eval")
 
         # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (

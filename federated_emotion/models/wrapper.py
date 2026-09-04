@@ -243,27 +243,48 @@ class FederatedClassifier(nn.Module):
             f"Loading backbone '{model_id}' (quantization: {quant_bits if has_bnb else 'None'}-bit, device_map: auto)..."
         )
 
-        # Load transformer backbone
-        try:
-            raw_backbone = AutoModel.from_pretrained(
-                model_id,
-                quantization_config=bnb_config,
-                device_map="auto" if torch.cuda.is_available() else None,
-                dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-                trust_remote_code=True,
-                token=token,
-            )
-        except Exception as e:
-            logger.warning(
-                f"AutoModel.from_pretrained failed for '{model_id}' ({e}); attempting fallback without quantization..."
-            )
-            raw_backbone = AutoModel.from_pretrained(
-                model_id,
-                device_map="auto" if torch.cuda.is_available() else None,
-                dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-                trust_remote_code=True,
-                token=token,
-            )
+        # Load transformer backbone with FlashAttention-2 / SDPA fallback
+        raw_backbone = None
+        if torch.cuda.is_available():
+            try:
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    dtype=compute_dtype,
+                    trust_remote_code=True,
+                    token=token,
+                    attn_implementation="flash_attention_2",
+                )
+                logger.info(f"Loaded '{model_id}' with flash_attention_2.")
+                print(f"  -> Backbone '{model_id}' loaded with flash_attention_2")
+            except Exception as e_fa2:
+                logger.warning(
+                    f"AutoModel.from_pretrained with flash_attention_2 failed for '{model_id}' ({e_fa2}); attempting sdpa fallback..."
+                )
+
+        if raw_backbone is None:
+            try:
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
+                logger.info(f"Loaded '{model_id}' with standard attention / SDPA.")
+            except Exception as e:
+                logger.warning(
+                    f"AutoModel.from_pretrained failed for '{model_id}' ({e}); attempting fallback without quantization..."
+                )
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
 
         # Dynamic hidden size resolution
         self.hidden_size = _extract_hidden_size(raw_backbone.config)

@@ -1,7 +1,8 @@
 # config.yaml
-num_clients: 10
+num_clients: 4
+active_client_ids: [1, 2, 3, 4]   # models: openchat-3.5-0106, zephyr-7b-beta, Qwen2.5-7B, Qwen2.5-7B-Instruct
 num_rounds: 3                    # configurable
-local_epochs: 2                  # configurable
+local_epochs: 3                  # configurable
 batch_size_train: 8
 batch_size_infer: 16
 max_seq_length: 128
@@ -10,6 +11,7 @@ lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.05
 quant_bits: 4
+optimizer_8bit: true             # bitsandbytes 8-bit AdamW optimizer for accelerated training and lower VRAM
 
 sparse_training:
   enabled: true          # master toggle — when false, every client uses

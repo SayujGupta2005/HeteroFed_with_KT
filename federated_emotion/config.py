@@ -89,6 +89,7 @@ class Config:
     active_client_ids: Optional[List[int]] = None
     num_classes: int = 6
     sparse_training: SparseTrainingConfig = field(default_factory=SparseTrainingConfig)
+    optimizer_8bit: bool = True
 
     @property
     def hf_token(self) -> Optional[str]:
@@ -164,6 +165,7 @@ class Config:
             active_client_ids=active_clients,
             num_classes=int(data.get("num_classes", 6)),
             sparse_training=sparse_training_cfg,
+            optimizer_8bit=bool(data.get("optimizer_8bit", True)),
         )
 
     @classmethod
