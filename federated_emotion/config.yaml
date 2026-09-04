@@ -1,15 +1,15 @@
 # config.yaml
-num_clients: 9
+num_clients: 5
 num_rounds: 5                    # configurable
 local_epochs: 3                  # configurable
-batch_size_train: 8
-batch_size_infer: 16
+batch_size_train: 2
+batch_size_infer: 4
 max_seq_length: 128
 learning_rate: 2e-4
 lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.05
-quant_bits: 4
+quant_bits: 16
 
 sparse_training:
   enabled: true          # master toggle — when false, every client uses

@@ -53,11 +53,11 @@ logger = logging.getLogger(__name__)
 # 1. Heterogeneous Client Model Registry (Client IDs 1-9)
 # ---------------------------------------------------------------------------
 CLIENT_MODELS: Dict[int, str] = {
-    1: "openchat/openchat-3.5-0106",                   # Mistral 7B (Ungated)
-    2: "HuggingFaceH4/zephyr-7b-beta",                  # Mistral 7B (Ungated)
-    3: "Qwen/Qwen2.5-7B",                              # Qwen 7B
-    4: "Qwen/Qwen2.5-7B-Instruct",                     # Qwen 7B
-    5: "microsoft/Phi-3.5-mini-instruct",              # Phi 3.8B
+    1: "Qwen/Qwen2.5-3B",                              # 3B
+    2: "microsoft/Phi-3.5-mini-instruct",              # 3.8B
+    3: "Qwen/Qwen1.5-4B-Chat",                         # 4B
+    4: "microsoft/Phi-3-mini-4k-instruct",             # 3.8B
+    5: "Qwen/Qwen2.5-3B-Instruct",                     # 3B
     6: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",      # DeepSeek 7B
     7: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",     # DeepSeek 8B
     8: "mistralai/Mistral-Nemo-Base-2407",             # Mistral Nemo 12B (Ungated)

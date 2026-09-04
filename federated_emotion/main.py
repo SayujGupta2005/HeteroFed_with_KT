@@ -444,6 +444,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     "mean_accuracy": float(np.mean(list(round_accuracies.values()))),
                 },
             )
+            
+            # Live update of the profiler at the end of each round
+            global_profiler.save_summary(results_dir / "timing_summary.json")
         else:
             print(f"[CRITICAL] Round {round_num}: No client succeeded. Moving to next round.")
 

@@ -285,7 +285,6 @@ def run_client_round(
         ce_loss_fn = nn.CrossEntropyLoss()
         kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
         
-        # Apply Wanda on the fly
         global_profiler.start(f"Client_Wanda_Calibration")
         _apply_wanda(model, train_loader, device, num_samples=128)
         global_profiler.stop(f"Client_Wanda_Calibration")
