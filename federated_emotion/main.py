@@ -38,10 +38,18 @@ import torch
 
 from federated_emotion.client import run_client_round
 from federated_emotion.config import Config, load_config
+from federated_emotion.profiler import global_profiler
 from federated_emotion.data.loaders import (
+    CANONICAL_LABELS,
     CLIENT_DATASETS,
+    compute_class_counts,
     load_private_dataset,
     load_public_dataset,
+)
+from federated_emotion.datafree import (
+    aggregate_class_logits,
+    logits_from_serializable,
+    logits_to_serializable,
 )
 from federated_emotion.eval_utils import (
     MetricTracker,
@@ -112,27 +120,51 @@ def _load_cached_client_result(
     client_id: int,
     round_num: int,
 ) -> Optional[Dict[str, Any]]:
-    """Attempt to reload saved logits and eval accuracy for a completed client round."""
+    """Attempt to reload a completed client round's upload payload and eval accuracy.
+
+    Restores whichever payload the mode uses: ``logits_on_kd_pool`` for public_set, or
+    ``class_logits`` + ``class_counts`` for data_free_fd.
+    """
     round_dir = checkpoint_dir / f"client_{client_id}" / f"round_{round_num}"
     logits_path = round_dir / "logits_kd.npy"
+    class_logits_path = round_dir / "class_logits.json"
     meta_path = round_dir / "meta.json"
 
-    if logits_path.exists() and meta_path.exists():
-        try:
-            logits = np.load(logits_path)
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            return {
-                "client_id": client_id,
-                "logits_on_kd_pool": logits,
-                "eval_accuracy": float(meta.get("eval_accuracy", 0.0)),
-            }
-        except Exception as e:
-            logger.warning(
-                f"Failed to read cache for Client {client_id} Round {round_num}: {e}"
-            )
-            return None
-    return None
+    if not meta_path.exists():
+        return None
+    if not (logits_path.exists() or class_logits_path.exists()):
+        return None
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        out: Dict[str, Any] = {
+            "client_id": client_id,
+            "mode": meta.get("mode"),
+            "eval_accuracy": float(meta.get("eval_accuracy", 0.0)),
+            "logits_on_kd_pool": None,
+            "class_logits": None,
+            "class_counts": None,
+            "cross_eval_accuracies": {},
+        }
+
+        if logits_path.exists():
+            out["logits_on_kd_pool"] = np.load(logits_path)
+
+        if class_logits_path.exists():
+            with open(class_logits_path, "r", encoding="utf-8") as f:
+                out["class_logits"] = logits_from_serializable(json.load(f))
+            counts = meta.get("class_counts")
+            if counts is not None:
+                out["class_counts"] = np.asarray(counts, dtype=np.int64)
+
+        return out
+    except Exception as e:
+        logger.warning(
+            f"Failed to read cache for Client {client_id} Round {round_num}: {e}"
+        )
+        return None
 
 
 def _cache_client_result(
@@ -141,20 +173,30 @@ def _cache_client_result(
     round_num: int,
     result: Dict[str, Any],
 ) -> None:
-    """Save client logits and evaluation metadata alongside adapter weights."""
+    """Save the client's upload payload and evaluation metadata alongside adapter weights."""
     round_dir = checkpoint_dir / f"client_{client_id}" / f"round_{round_num}"
     round_dir.mkdir(parents=True, exist_ok=True)
     try:
-        logits_path = round_dir / "logits_kd.npy"
-        np.save(logits_path, result["logits_on_kd_pool"])
+        if result.get("logits_on_kd_pool") is not None:
+            np.save(round_dir / "logits_kd.npy", result["logits_on_kd_pool"])
 
+        if result.get("class_logits"):
+            with open(round_dir / "class_logits.json", "w", encoding="utf-8") as f:
+                json.dump(logits_to_serializable(result["class_logits"]), f, indent=2)
+
+        counts = result.get("class_counts")
         meta_path = round_dir / "meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "client_id": client_id,
                     "round_num": round_num,
+                    "mode": result.get("mode"),
                     "eval_accuracy": float(result["eval_accuracy"]),
+                    "eval_source": result.get("eval_source"),
+                    "class_counts": (
+                        np.asarray(counts, dtype=np.int64).tolist() if counts is not None else None
+                    ),
                 },
                 f,
                 indent=2,
@@ -206,19 +248,30 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     # Initialize Metric Tracker
     metric_tracker = MetricTracker(log_dir=str(log_path))
 
-    # 1. Load Public Datasets
-    print("[1/4] Loading Public Knowledge Distillation and Evaluation Datasets...")
-    public_kd_pool, public_eval_holdout = load_public_dataset(config)
-    print(
-        f"  -> Public KD Pool Loaded        : {len(public_kd_pool)} instances"
-    )
-    print(
-        f"  -> Public Eval Holdout Loaded  : {len(public_eval_holdout)} instances\n"
-    )
+    # 1. Load Public Datasets (public_set mode only)
+    public_kd_pool = None
+    public_eval_holdout = None
+    if config.is_data_free:
+        print("[1/4] Data-free mode: no public transfer pool or public holdout is loaded.")
+        print("      Clients exchange per-class averaged logits and are scored on their own")
+        print("      held-out slices, so no shared corpus touches the algorithm.\n")
+    else:
+        print("[1/4] Loading Public Knowledge Distillation and Evaluation Datasets...")
+        global_profiler.start("Server_Load_Public_Data")
+        public_kd_pool, public_eval_holdout = load_public_dataset(config)
+        global_profiler.stop("Server_Load_Public_Data")
+        print(
+            f"  -> Public KD Pool Loaded        : {len(public_kd_pool)} instances"
+        )
+        print(
+            f"  -> Public Eval Holdout Loaded  : {len(public_eval_holdout)} instances\n"
+        )
 
     # 2. Pre-load Client Private Datasets & Build Cross-Dataset Evaluation Suite
     print("[2/4] Pre-loading Client Private Datasets & Slicing Holdouts...")
     private_train_datasets: Dict[int, Any] = {}
+    local_eval_holdouts: Dict[int, Any] = {}
+    client_class_counts: Dict[int, Any] = {}
     cross_eval_datasets: Dict[str, Any] = {}
     active_clients: List[int] = []
 
@@ -232,15 +285,22 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     client_manifest_entries: List[str] = []
 
     for client_id in target_client_ids:
+        global_profiler.start("Server_Load_Private_Data")
         raw_ds = load_private_dataset(client_id, config)
+        global_profiler.stop("Server_Load_Private_Data")
         if raw_ds is not None and len(raw_ds) > 0:
             m_id = get_model_for_client(client_id)
             m_short = m_id.split("/")[-1]
             ds_info = CLIENT_DATASETS.get(client_id, ("Custom", None))
             ds_name = ds_info[0] + (f" ({ds_info[1]})" if ds_info[1] else "")
 
-            # Extract small private holdout for cross-dataset evaluation
-            holdout_len = min(50, max(5, int(len(raw_ds) * 0.1)))
+            # Carve this client's own held-out slice. In data-free mode this is the *only*
+            # evaluation set the client has, so it needs enough examples to be readable --
+            # config.local_holdout_size, not the old hard-coded 50 (~8 per class).
+            holdout_len = min(
+                config.local_holdout_size,
+                max(5, int(len(raw_ds) * 0.1)),
+            )
             if len(raw_ds) > holdout_len:
                 train_slice = raw_ds.select(range(len(raw_ds) - holdout_len))
                 eval_slice = raw_ds.select(range(len(raw_ds) - holdout_len, len(raw_ds)))
@@ -249,6 +309,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                 eval_slice = raw_ds
 
             private_train_datasets[client_id] = train_slice
+            local_eval_holdouts[client_id] = eval_slice
+            client_class_counts[client_id] = compute_class_counts(train_slice, config.num_classes)
             active_clients.append(client_id)
 
             col_header = f"Dataset: {ds_name} [Client {client_id:02d}: {m_short}]"
@@ -263,10 +325,38 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
         print("\n[CRITICAL ERROR] No active clients available with valid datasets. Exiting.")
         sys.exit(1)
 
-    # Also include Public Holdout in cross-dataset evaluation
-    cross_eval_datasets["Public Holdout [dair-ai/emotion]"] = public_eval_holdout
+    # Also include Public Holdout in cross-dataset evaluation (public_set mode only)
+    if not config.is_data_free:
+        cross_eval_datasets["Public Holdout [dair-ai/emotion]"] = public_eval_holdout
+
+    # Report class coverage: both modes aggregate per class, so absent or thin classes matter.
+    print("\n  Class coverage of the active roster (train slices):")
+    header = "    " + f"{'client':<8}" + "".join(f"{c:>10}" for c in CANONICAL_LABELS[:config.num_classes])
+    print(header)
+    for cid in active_clients:
+        counts = client_class_counts[cid]
+        print("    " + f"{cid:<8}" + "".join(f"{int(n):>10}" for n in counts))
+    totals = np.sum([client_class_counts[c] for c in active_clients], axis=0)
+    print("    " + f"{'TOTAL':<8}" + "".join(f"{int(n):>10}" for n in totals))
+    holders = np.sum([client_class_counts[c] > 0 for c in active_clients], axis=0)
+    print("    " + f"{'holders':<8}" + "".join(f"{int(n):>10}" for n in holders))
+    for j, name in enumerate(CANONICAL_LABELS[:config.num_classes]):
+        if holders[j] == 0:
+            print(f"    [FATAL] class '{name}' is absent from every client; it cannot be learned.")
+        elif holders[j] == 1:
+            print(f"    [WARN ] class '{name}' is held by only 1 client; no consensus is possible.")
+    print()
 
     # Write run_info.txt
+    # The rank actually handed to LoraConfig is sparse_training.reduced_rank whenever sparse
+    # training is on -- report that, not config.lora_rank, which the manifest used to print
+    # regardless and which silently misreported every sparse run.
+    effective_lora_rank = (
+        config.sparse_training.reduced_rank
+        if config.sparse_training.enabled
+        else config.lora_rank
+    )
+
     run_info_file = results_dir / "run_info.txt"
     try:
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -283,18 +373,39 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
             "-" * 85,
             "GLOBAL CONFIGURATION & HYPERPARAMETERS",
             "-" * 85,
+            f"Federation Mode        : {config.mode}",
             f"Active Clients         : {len(active_clients)} of {config.num_clients} configured",
             f"Communication Rounds   : {config.num_rounds}",
             f"Local Epochs / Client  : {config.local_epochs}",
             f"Batch Size (Train/Inf) : {config.batch_size_train} / {config.batch_size_infer}",
             f"Max Sequence Length    : {config.max_seq_length}",
-            f"Quantization           : {config.quant_bits}-bit NF4",
-            f"LoRA Hyperparameters   : Rank={config.lora_rank}, Alpha={config.lora_alpha}, Dropout={config.lora_dropout}",
+            (
+                f"Quantization           : {config.quant_bits}-bit NF4"
+                if config.quant_bits in (4, 8)
+                else f"Quantization           : DISABLED (quant_bits={config.quant_bits}; "
+                     f"NF4 requires 4 or 8)"
+            ),
+            f"LoRA Hyperparameters   : Rank={effective_lora_rank}, Alpha={config.lora_alpha}, Dropout={config.lora_dropout}",
+            f"Sparse Training        : {config.sparse_training.enabled}"
+            + (f" (reduced_rank={config.sparse_training.reduced_rank})" if config.sparse_training.enabled else ""),
             f"Learning Rate          : {config.learning_rate}",
-            f"Knowledge Distillation : Lambda={config.kd_lambda}, Temperature={config.kd_temperature}, Warmup={config.kd_warmup_rounds} rounds",
-            f"Consensus Aggregation  : Mode={config.aggregation_mode}, Temperature={config.aggregation_temperature}",
-            f"Public KD Pool Size    : {len(public_kd_pool)}",
-            f"Public Holdout Size    : {len(public_eval_holdout)}",
+        ] + (
+            [
+                f"Distillation (FD)      : Lambda={config.fd_lambda}, Temperature={config.fd_temperature}, "
+                f"Warmup={config.kd_warmup_rounds} rounds",
+                f"Aggregation            : per-class logits, "
+                f"{'count-weighted' if config.fd_weight_by_count else 'unweighted (reference FD)'}",
+                f"Public Transfer Set    : NONE (data-free)",
+                f"Client Eval Source     : own local holdout ({config.local_holdout_size} max per client)",
+            ]
+            if config.is_data_free
+            else [
+                f"Knowledge Distillation : Lambda={config.kd_lambda}, Temperature={config.kd_temperature}, Warmup={config.kd_warmup_rounds} rounds",
+                f"Consensus Aggregation  : Mode={config.aggregation_mode}, Temperature={config.aggregation_temperature}",
+                f"Public KD Pool Size    : {len(public_kd_pool)}",
+                f"Public Holdout Size    : {len(public_eval_holdout)}",
+            ]
+        ) + [
             "",
             "-" * 85,
             "PARTICIPATING CLIENTS & BACKBONE ARCHITECTURES",
@@ -316,24 +427,38 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
     # 3. Pre-load & Verify all Client Models Upfront
     print("[3/4] Pre-loading & Verifying Backbone Models for All Active Clients...")
-    preload_client_models(active_clients, config)
+    if len(active_clients) > 0:
+        global_profiler.start("Server_Model_Preloading")
+        preload_client_models(active_clients, config)
+        global_profiler.stop("Server_Model_Preloading")
 
     # 4. Communication Rounds Loop
     print("[4/4] Commencing Federated Communication Rounds...\n")
-    avg_soft_labels: Optional[np.ndarray] = None
+    avg_soft_labels: Optional[np.ndarray] = None          # public_set consensus
+    global_class_logits: Optional[Dict[int, np.ndarray]] = None   # data_free_fd consensus
 
     for round_num in range(1, config.num_rounds + 1):
         print(f"\n>>>>>>>> STARTING COMMUNICATION ROUND {round_num}/{config.num_rounds} <<<<<<<<")
 
-        # If resuming and soft labels already saved from previous round, load them if needed
-        if resume and avg_soft_labels is None and round_num > 1:
-            prev_labels_file = log_path / f"round_{round_num - 1}_avg_soft_labels.npy"
-            if prev_labels_file.exists():
-                try:
-                    avg_soft_labels = np.load(prev_labels_file)
-                    print(f"  -> Resumed previous consensus soft labels from {prev_labels_file}")
-                except Exception as e:
-                    logger.warning(f"Could not load previous soft labels: {e}")
+        # If resuming, reload the previous round's consensus artifact
+        if resume and round_num > 1:
+            if config.is_data_free and global_class_logits is None:
+                prev_fd_file = log_path / f"round_{round_num - 1}_global_class_logits.json"
+                if prev_fd_file.exists():
+                    try:
+                        with open(prev_fd_file, "r", encoding="utf-8") as f_fd:
+                            global_class_logits = logits_from_serializable(json.load(f_fd))
+                        print(f"  -> Resumed previous global class logits from {prev_fd_file}")
+                    except Exception as e:
+                        logger.warning(f"Could not load previous global class logits: {e}")
+            elif not config.is_data_free and avg_soft_labels is None:
+                prev_labels_file = log_path / f"round_{round_num - 1}_avg_soft_labels.npy"
+                if prev_labels_file.exists():
+                    try:
+                        avg_soft_labels = np.load(prev_labels_file)
+                        print(f"  -> Resumed previous consensus soft labels from {prev_labels_file}")
+                    except Exception as e:
+                        logger.warning(f"Could not load previous soft labels: {e}")
 
         client_results: List[Dict[str, Any]] = []
 
@@ -352,6 +477,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     result = cached_res
 
             if result is None:
+                # Cross-dataset testing: Only evaluate across all datasets on the final round
+                current_cross_eval = cross_eval_datasets if round_num == config.num_rounds else None
+
                 result = run_client_round(
                     client_id=client_id,
                     round_num=round_num,
@@ -360,7 +488,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     public_kd_pool=public_kd_pool,
                     public_eval_holdout=public_eval_holdout,
                     private_dataset=private_train_datasets[client_id],
-                    cross_eval_datasets=cross_eval_datasets,
+                    cross_eval_datasets=current_cross_eval,
+                    local_eval_holdout=local_eval_holdouts[client_id],
+                    global_class_logits=global_class_logits,
                 )
 
                 if result is not None:
@@ -373,18 +503,49 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
         # Server Aggregation of Logits & Cross-Dataset Matrix Computation
         if client_results:
-            # Print & Export Model x Dataset Cross-Evaluation Performance Matrix
-            print_and_export_cross_dataset_matrix(round_num, client_results, results_dir, config)
-            print_and_export_cross_dataset_matrix(round_num, client_results, log_path, config)
+            global_profiler.start("Server_Aggregation")
+            # Print & Export Model x Dataset Cross-Evaluation Performance Matrix (final round only)
+            if round_num == config.num_rounds:
+                print_and_export_cross_dataset_matrix(round_num, client_results, results_dir, config)
+                print_and_export_cross_dataset_matrix(round_num, client_results, log_path, config)
 
-            avg_soft_labels = aggregate(client_results, config)
+            if config.is_data_free:
+                # Average each class's logit vector across the clients that hold that class.
+                per_client_logits = [r.get("class_logits") for r in client_results]
+                per_client_counts = (
+                    [r.get("class_counts") for r in client_results]
+                    if config.fd_weight_by_count
+                    else None
+                )
+                global_class_logits = aggregate_class_logits(
+                    per_client_logits,
+                    class_counts=per_client_counts,
+                    num_classes=config.num_classes,
+                )
 
-            # Persist consensus teacher soft labels
-            if avg_soft_labels is not None:
-                soft_labels_path = log_path / f"round_{round_num}_avg_soft_labels.npy"
-                np.save(soft_labels_path, avg_soft_labels)
-                np.save(results_dir / f"round_{round_num}_avg_soft_labels.npy", avg_soft_labels)
-                print(f"  -> Persisted consensus teacher soft labels to: {soft_labels_path}")
+                if global_class_logits is not None:
+                    payload = logits_to_serializable(global_class_logits)
+                    for target_dir in [log_path, results_dir]:
+                        fd_path = target_dir / f"round_{round_num}_global_class_logits.json"
+                        with open(fd_path, "w", encoding="utf-8") as f_fd:
+                            json.dump(payload, f_fd, indent=2)
+                    n_bytes = len(payload) * config.num_classes * 4
+                    print(
+                        f"  -> Persisted global per-class logits "
+                        f"({len(payload)} classes, {n_bytes} bytes) to: "
+                        f"{log_path / f'round_{round_num}_global_class_logits.json'}"
+                    )
+            else:
+                avg_soft_labels = aggregate(client_results, config)
+
+                # Persist consensus teacher soft labels
+                if avg_soft_labels is not None:
+                    soft_labels_path = log_path / f"round_{round_num}_avg_soft_labels.npy"
+                    np.save(soft_labels_path, avg_soft_labels)
+                    np.save(results_dir / f"round_{round_num}_avg_soft_labels.npy", avg_soft_labels)
+                    print(f"  -> Persisted consensus teacher soft labels to: {soft_labels_path}")
+
+            global_profiler.stop("Server_Aggregation")
 
             # Record round metrics
             round_accuracies = {
@@ -433,6 +594,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     print("=" * 80)
     metric_tracker.save_summary()
     summarize_run(config, results_dir=results_dir)
+
+    # Save execution time profiler summary
+    global_profiler.save_summary(results_dir / "timing_summary.json")
     print(f"\n[COMPLETE] All run artifacts and manifests saved in: {results_dir.resolve()}\n")
 
 

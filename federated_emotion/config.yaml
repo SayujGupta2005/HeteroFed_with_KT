@@ -1,38 +1,91 @@
 # config.yaml
-num_clients: 10
-num_rounds: 3                    # configurable
-local_epochs: 2                  # configurable
+#
+# mode selects which federation approach runs. Everything under the other mode's header is
+# ignored, so one file drives both.
+#
+#   public_set    Clients exchange soft labels over a shared public transfer pool
+#                 (dair-ai/emotion). FedMD / FedDF / DS-FL lineage. Uses kd_*,
+#                 aggregation_* and public_* settings.
+#
+#   data_free_fd  No shared corpus at all. Clients exchange one averaged logit vector per
+#                 class they hold (FedDistill, Jeong et al. 2018, arXiv:1811.11479), and are
+#                 scored on their own held-out slices. Uses fd_* settings.
+#                 Upload is num_classes^2 floats per client per round -- 144 bytes for 6
+#                 classes. Only one forward pass per training step, versus two in public_set.
+
+# mode: "public_set"
+mode: "data_free_fd"
+
+# ---------------------------------------------------------------------------
+# clients
+# ---------------------------------------------------------------------------
+# Five 3-4B backbones across three architecture families, one loaded at a time.
+#   1 Phi-3.5-mini-instruct    <- go_emotions (simplified)
+#   2 Qwen2.5-3B-Instruct      <- tweet_eval (emotion)
+#   3 Phi-3-mini-4k-instruct   <- sem_eval_2018_task1 (subtask5.english)
+#   4 Qwen2.5-3B               <- xed_en_fi (en_annotated)
+#   5 Qwen1.5-4B-Chat          <- emotion (dair-ai)
+#
+# Clients 4 and 5 replace the old silicone entries, whose HF loaders no longer work; they
+# previously "loaded" only because DATASET_ALIASES redirected them to mteb/emotion, i.e. the
+# evaluation corpus. dair-ai/emotion is legitimate as a client dataset here because
+# data_free_fd loads no public pool -- and it is the only source carrying all six canonical
+# labels, which lifts 'love' from one usable holder to two.
+num_clients: 5
+active_client_ids: [1, 2, 3, 4, 5]
+
+num_rounds: 5
+local_epochs: 3
 batch_size_train: 8
 batch_size_infer: 16
 max_seq_length: 128
 learning_rate: 2e-4
+
+# ---------------------------------------------------------------------------
+# model / adapter
+# ---------------------------------------------------------------------------
+quant_bits: 4                    # real NF4. Values other than 4 or 8 disable quantization
+                                 # entirely, which is what "16-bit NF4" in earlier manifests
+                                 # actually meant.
 lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.05
-quant_bits: 4
+optimizer_8bit: true             # bitsandbytes 8-bit AdamW; frees VRAM for a larger batch
 
 sparse_training:
-  enabled: true          # master toggle — when false, every client uses
-                           # the normal config.lora_rank value, pipeline
-                           # behaves exactly as before
-  reduced_rank: 2         # LoRA rank to use for ALL clients when enabled,
-                           # in place of the normal lora_rank (e.g. 8).
-                           # Smaller rank = fewer trainable parameters =
-                           # smaller matrices = faster forward/backward pass.
+  enabled: false                 # when true, reduced_rank overrides lora_rank for ALL clients
+  reduced_rank: 2
 
-kd_lambda: 0.5                   # weight of distillation loss term
-kd_warmup_rounds: 1              # rounds before KD term activates (0 = from round 1)
+# ---------------------------------------------------------------------------
+# mode: data_free_fd  -- per-class logits only, no shared corpus
+# ---------------------------------------------------------------------------
+fd_lambda: 1.0                   # weight of the per-class logit distillation term
+fd_temperature: 2.0              # softmax temperature for that term
+fd_weight_by_count: true         # weight client k's class-c logit by its class-c example
+                                 # count. false reproduces the reference unweighted mean, in
+                                 # which sem_eval's 13 'love' examples carry the same vote as
+                                 # go_emotions' 475.
+
+# ---------------------------------------------------------------------------
+# mode: public_set  -- shared public transfer pool
+# ---------------------------------------------------------------------------
+kd_lambda: 0.5
 kd_temperature: 2.0
-
 aggregation_mode: "accuracy_weighted"   # or "uniform"
 aggregation_temperature: 1.0
+public_kd_pool_size: 500
+public_eval_holdout_size: 200
 
-public_kd_pool_size: 500         # subset of public dataset used per round for logit averaging
-public_eval_holdout_size: 200    # separate held-out slice, never used in KD averaging
-private_dataset_max_size: 2000   # maximum number of examples per private client dataset
+# ---------------------------------------------------------------------------
+# shared
+# ---------------------------------------------------------------------------
+kd_warmup_rounds: 1              # rounds trained purely locally before distillation starts.
+                                 # Round 1 is therefore a free local-only reference point.
+local_holdout_size: 200          # per-client held-out slice; the only eval set in data-free
+                                 # mode, so it must be large enough to read (was 50).
+private_dataset_max_size: 2000   # cap per client, before the holdout is carved off
 
-seed_base: 42                    # seed_client_i = seed_base + i
+seed_base: 42
 checkpoint_dir: "./checkpoints"
 log_dir: "./logs"
 hf_token_env_var: "HF_TOKEN"
-

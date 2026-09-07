@@ -50,22 +50,31 @@ from federated_emotion.config import Config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 1. Heterogeneous Client Model Registry (Client IDs 1-10)
+# 1. Heterogeneous Client Model Registry
 # ---------------------------------------------------------------------------
+# Active roster: five 3-4B backbones spanning three architecture families
+# (Phi-3, Qwen2.5, Qwen1.5). Sized to run one at a time in 4-bit NF4 on a 16 GB card.
+#
+# IDs and ordering deliberately match the parallel public-set experiment so that data-free and
+# public-set results are directly comparable: same backbones, same datasets, same hardware.
+#
+# Under mode="data_free_fd" only [num_classes] logit vectors are exchanged, so differing hidden
+# sizes and depths across families cost nothing -- no feature_dim alignment or projection needed.
 CLIENT_MODELS: Dict[int, str] = {
-    1: "openchat/openchat-3.5-0106",                   # Mistral 7B (Ungated)
-    2: "HuggingFaceH4/zephyr-7b-beta",                  # Mistral 7B (Ungated)
-    3: "Qwen/Qwen2.5-7B",                              # Qwen 7B
-    4: "Qwen/Qwen2.5-7B-Instruct",                     # Qwen 7B
-    5: "microsoft/Phi-3.5-mini-instruct",              # Phi 3.8B
-    6: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",      # DeepSeek 7B
-    7: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",     # DeepSeek 8B
-    8: "mistralai/Mistral-Nemo-Base-2407",             # Mistral Nemo 12B (Ungated)
-    9: "Qwen/Qwen2.5-14B",                             # Qwen 14B
-    10: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",    # DeepSeek 14B
+    1: "microsoft/Phi-3.5-mini-instruct",              # Phi-3     3.8B  hidden 3072
+    2: "Qwen/Qwen2.5-3B-Instruct",                     # Qwen2.5   3B    hidden 2048
+    3: "microsoft/Phi-3-mini-4k-instruct",             # Phi-3     3.8B  hidden 3072
+    4: "Qwen/Qwen2.5-3B",                              # Qwen2.5   3B    hidden 2048
+    5: "Qwen/Qwen1.5-4B-Chat",                         # Qwen1.5   4B    hidden 2560
+    # --- larger tier, kept for reference / future runs ---
+    6: "Qwen/Qwen2.5-7B",                              # Qwen 7B
+    7: "Qwen/Qwen2.5-7B-Instruct",                     # Qwen 7B
+    8: "openchat/openchat-3.5-0106",                   # Mistral 7B (ungated)
+    9: "HuggingFaceH4/zephyr-7b-beta",                 # Mistral 7B (ungated)
+    10: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",     # DeepSeek 7B
 }
 
-DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-7B"       # Default for client IDs beyond registry (5-7B tier)
+DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-3B"       # Default for client IDs beyond registry (3-4B tier)
 
 
 def get_model_for_client(client_id: int) -> str:
@@ -243,27 +252,48 @@ class FederatedClassifier(nn.Module):
             f"Loading backbone '{model_id}' (quantization: {quant_bits if has_bnb else 'None'}-bit, device_map: auto)..."
         )
 
-        # Load transformer backbone
-        try:
-            raw_backbone = AutoModel.from_pretrained(
-                model_id,
-                quantization_config=bnb_config,
-                device_map="auto" if torch.cuda.is_available() else None,
-                dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-                trust_remote_code=True,
-                token=token,
-            )
-        except Exception as e:
-            logger.warning(
-                f"AutoModel.from_pretrained failed for '{model_id}' ({e}); attempting fallback without quantization..."
-            )
-            raw_backbone = AutoModel.from_pretrained(
-                model_id,
-                device_map="auto" if torch.cuda.is_available() else None,
-                dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-                trust_remote_code=True,
-                token=token,
-            )
+        # Load transformer backbone with FlashAttention-2 / SDPA fallback
+        raw_backbone = None
+        if torch.cuda.is_available():
+            try:
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    dtype=compute_dtype,
+                    trust_remote_code=True,
+                    token=token,
+                    attn_implementation="flash_attention_2",
+                )
+                logger.info(f"Loaded '{model_id}' with flash_attention_2.")
+                print(f"  -> Backbone '{model_id}' loaded with flash_attention_2")
+            except Exception as e_fa2:
+                logger.warning(
+                    f"AutoModel.from_pretrained with flash_attention_2 failed for '{model_id}' ({e_fa2}); attempting sdpa fallback..."
+                )
+
+        if raw_backbone is None:
+            try:
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
+                logger.info(f"Loaded '{model_id}' with standard attention / SDPA.")
+            except Exception as e:
+                logger.warning(
+                    f"AutoModel.from_pretrained failed for '{model_id}' ({e}); attempting fallback without quantization..."
+                )
+                raw_backbone = AutoModel.from_pretrained(
+                    model_id,
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=token,
+                )
 
         # Dynamic hidden size resolution
         self.hidden_size = _extract_hidden_size(raw_backbone.config)

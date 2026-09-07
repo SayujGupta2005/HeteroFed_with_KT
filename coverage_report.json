@@ -1,0 +1,96 @@
+{
+  "mode": "data_free_fd",
+  "num_classes": 6,
+  "canonical_labels": [
+    "sadness",
+    "joy",
+    "love",
+    "anger",
+    "fear",
+    "surprise"
+  ],
+  "private_dataset_max_size": 2000,
+  "thin_threshold": 20,
+  "requested_clients": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "loaded_clients": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "unavailable_clients": [],
+  "clients": {
+    "1": {
+      "dataset": "go_emotions/simplified",
+      "model": "microsoft/Phi-3.5-mini-instruct",
+      "counts": [
+        310,
+        331,
+        475,
+        472,
+        153,
+        259
+      ],
+      "total": 2000
+    },
+    "2": {
+      "dataset": "tweet_eval/emotion",
+      "model": "Qwen/Qwen2.5-3B-Instruct",
+      "counts": [
+        581,
+        511,
+        0,
+        908,
+        0,
+        0
+      ],
+      "total": 2000
+    },
+    "3": {
+      "dataset": "sem_eval_2018_task1/subtask5.english",
+      "model": "microsoft/Phi-3-mini-4k-instruct",
+      "counts": [
+        363,
+        751,
+        13,
+        617,
+        228,
+        28
+      ],
+      "total": 2000
+    },
+    "4": {
+      "dataset": "xed_en_fi/en_annotated",
+      "model": "Qwen/Qwen2.5-3B",
+      "counts": [
+        310,
+        477,
+        0,
+        611,
+        321,
+        281
+      ],
+      "total": 2000
+    },
+    "5": {
+      "dataset": "emotion",
+      "model": "Qwen/Qwen1.5-4B-Chat",
+      "counts": [
+        560,
+        692,
+        180,
+        270,
+        223,
+        75
+      ],
+      "total": 2000
+    }
+  }
+}

@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Optional, Set
 import yaml
 
 
+#: Supported federation modes.
+#:
+#: - ``public_set``   -- the original method. Clients exchange soft labels computed over a shared
+#:                       public transfer pool (``dair-ai/emotion``). FedMD / FedDF / DS-FL lineage.
+#: - ``data_free_fd`` -- no shared corpus at all. Clients exchange per-class averaged logits
+#:                       (FedDistill / FD, Jeong et al. 2018). Communication is O(num_classes^2).
+SUPPORTED_MODES: Set[str] = {"public_set", "data_free_fd"}
+
 REQUIRED_CONFIG_FIELDS: Set[str] = {
     "num_clients",
     "num_rounds",
@@ -89,6 +97,37 @@ class Config:
     active_client_ids: Optional[List[int]] = None
     num_classes: int = 6
     sparse_training: SparseTrainingConfig = field(default_factory=SparseTrainingConfig)
+    optimizer_8bit: bool = True
+
+    # --- Federation mode ---------------------------------------------------
+    #: One of SUPPORTED_MODES. Defaults to the original public-transfer-set method so that
+    #: pre-existing config.yaml files behave exactly as before.
+    mode: str = "public_set"
+
+    # --- data_free_fd parameters (ignored when mode == "public_set") -------
+    #: Weight on the per-class logit distillation term. HtFLlib's tuned value for FD is 1.0.
+    fd_lambda: float = 1.0
+    #: Softmax temperature for the FD distillation term.
+    fd_temperature: float = 2.0
+    #: Weight each client's class-c logit by how many class-c examples it holds. The reference
+    #: FD implementation uses an unweighted mean, which gives a client holding 3 examples of a
+    #: class the same vote as one holding 3000. Set False to reproduce the reference.
+    fd_weight_by_count: bool = True
+
+    #: Maximum size of each client's own held-out slice, carved off the tail of its private
+    #: dataset. In data_free_fd mode this is the ONLY evaluation set a client has, so the old
+    #: hard-coded 50 (~8 examples per class over 6 classes) was far too small to read.
+    local_holdout_size: int = 200
+
+    @property
+    def is_public_set(self) -> bool:
+        """True when the pipeline uses the shared public transfer pool."""
+        return self.mode == "public_set"
+
+    @property
+    def is_data_free(self) -> bool:
+        """True when the pipeline exchanges only per-class statistics (no shared corpus)."""
+        return self.mode == "data_free_fd"
 
     @property
     def hf_token(self) -> Optional[str]:
@@ -122,6 +161,12 @@ class Config:
         if missing_fields:
             raise ValueError(
                 f"Missing required configuration field(s) in config.yaml: {sorted(list(missing_fields))}"
+            )
+
+        mode = str(data.get("mode", "public_set"))
+        if mode not in SUPPORTED_MODES:
+            raise ValueError(
+                f"Unknown mode '{mode}' in config.yaml; expected one of {sorted(SUPPORTED_MODES)}."
             )
 
         active_clients = None
@@ -164,6 +209,12 @@ class Config:
             active_client_ids=active_clients,
             num_classes=int(data.get("num_classes", 6)),
             sparse_training=sparse_training_cfg,
+            optimizer_8bit=bool(data.get("optimizer_8bit", True)),
+            mode=mode,
+            fd_lambda=float(data.get("fd_lambda", 1.0)),
+            fd_temperature=float(data.get("fd_temperature", 2.0)),
+            fd_weight_by_count=bool(data.get("fd_weight_by_count", True)),
+            local_holdout_size=int(data.get("local_holdout_size", 200)),
         )
 
     @classmethod

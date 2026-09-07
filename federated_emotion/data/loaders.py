@@ -11,7 +11,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import os
 import sys
 from pathlib import Path
@@ -24,6 +24,7 @@ if str(_parent_dir) not in sys.path:
 if str(_pkg_dir) not in sys.path:
     sys.path.insert(0, str(_pkg_dir))
 
+import numpy as np
 from datasets import Dataset, concatenate_datasets, load_dataset
 
 from federated_emotion.config import Config
@@ -48,32 +49,72 @@ NUM_CLASSES: int = len(CANONICAL_LABELS)  # 6
 
 
 # ---------------------------------------------------------------------------
-# 2. Client Datasets Registry (Client IDs 1-10)
+# 2. Client Datasets Registry
 # ---------------------------------------------------------------------------
+# IDs 1-5 are the active roster, all verified loadable 2026-09 (see coverage_report.json).
+# IDs 6+ are retained for provenance only; every one of them fails to load.
+#
+# Note on ID 5 (``emotion`` = dair-ai/emotion): this is the corpus that serves as the public
+# KD pool in ``mode: public_set``. In ``mode: data_free_fd`` there is no public pool at all, so
+# it is available as an ordinary client dataset -- and it is the only source that natively
+# carries all six canonical labels, which is what lifts ``love`` from one usable holder to two.
+# load_private_dataset() refuses it while mode == public_set (see PUBLIC_DATASET_SOURCES).
 CLIENT_DATASETS: Dict[int, Tuple[str, Optional[str]]] = {
+    # --- active roster ---------------------------------------------------
     1: ("go_emotions", "simplified"),
     2: ("tweet_eval", "emotion"),
     3: ("sem_eval_2018_task1", "subtask5.english"),
-    4: ("silicone", "dyda_e"),
-    5: ("silicone", "meld_e"),
-    6: ("silicone", "iemocap"),
-    7: ("empathetic_dialogues", None),
-    8: ("emo", None),
-    9: ("xed_en_fi", "en_annotated"),
-    10: ("poem_sentiment", None),
+    4: ("xed_en_fi", "en_annotated"),
+    5: ("emotion", None),
+    # --- broken: all ship a loading script, which `datasets` v3+ rejects with
+    #     "Dataset scripts are no longer supported, but found <name>.py".
+    #     Verified 2026-09. Kept only so the provenance of the roster is legible.
+    #
+    #     silicone/*, empathetic_dialogues and emo previously appeared to work only because
+    #     DATASET_ALIASES silently redirected them to mteb/emotion -- the evaluation corpus.
+    #     That redirect has been removed; they now fail honestly.
+    #
+    #     daily_dialog is the upstream source of silicone/dyda_e and was trialled as its
+    #     replacement. It fails for the same reason, so xed_en_fi and dair-ai/emotion took
+    #     slots 4 and 5 instead.
+    6: ("silicone", "dyda_e"),
+    7: ("silicone", "meld_e"),
+    8: ("silicone", "iemocap"),
+    9: ("empathetic_dialogues", None),
+    10: ("emo", None),
+    11: ("daily_dialog", None),
+    12: ("poem_sentiment", None),
 }
 
 # Candidate Hugging Face Hub repository paths for each dataset to handle
 # modern namespaces and Parquet mirrors as well as legacy top-level dataset names across hub versions.
+#
+# IMPORTANT: aliases must resolve to the *same underlying corpus* as the key. Adding a
+# convenient-but-unrelated repository here silently substitutes the wrong data. In particular,
+# no private-client alias may point at an `emotion` mirror -- that is the public KD/eval corpus,
+# and using it as a client dataset leaks the evaluation set into training (see PUBLIC_DATASET_SOURCES).
 DATASET_ALIASES: Dict[str, List[str]] = {
     "go_emotions": ["google-research-datasets/go_emotions", "go_emotions"],
     "tweet_eval": ["cardiffnlp/tweet_eval", "tweet_eval"],
     "sem_eval_2018_task1": ["vibhorag101/sem_eval_2018_task_1_english_cleaned_labels", "sem_eval_2018_task1"],
-    "silicone": ["mteb/emotion", "eusip/silicone", "silicone"],
-    "empathetic_dialogues": ["mteb/emotion", "facebook/empathetic_dialogues", "empathetic_dialogues"],
-    "emo": ["mteb/emotion", "emo"],
+    "silicone": ["eusip/silicone", "silicone"],
+    "empathetic_dialogues": ["facebook/empathetic_dialogues", "empathetic_dialogues"],
+    "emo": ["emo"],
     "xed_en_fi": ["akkasi/xed_en_fi", "Helsinki-NLP/xed_en_fi", "xed_en_fi"],
     "poem_sentiment": ["google-research-datasets/poem_sentiment", "poem_sentiment"],
+    "emotion": ["dair-ai/emotion", "emotion"],
+    # Retained but non-functional: both paths serve a loading script, rejected by datasets v3+.
+    "daily_dialog": ["li2017dailydialog/daily_dialog", "daily_dialog"],
+}
+
+# Hub paths that back the *public* KD pool / evaluation holdout. A private client dataset that
+# resolves to any of these would train on the evaluation data, inflating its holdout accuracy and
+# -- because aggregation_mode="accuracy_weighted" -- corrupting the consensus for every other
+# client. load_private_dataset() refuses such a resolution outright.
+PUBLIC_DATASET_SOURCES: Set[str] = {
+    "dair-ai/emotion",
+    "mteb/emotion",
+    "emotion",
 }
 
 
@@ -301,7 +342,46 @@ LABEL_MAPS: Dict[str, Dict[Union[str, int], Optional[int]]] = {
         "trust": None,
     },
 
-    # 10. poem_sentiment: 0: negative, 1: positive, 2: no_impact, 3: mixed
+    # 10. emotion (dair-ai/emotion). This dataset *defines* the canonical taxonomy, so the
+    # mapping is the identity. Integer ids are already 0-5 in canonical order.
+    "emotion": {
+        0: LABEL_TO_ID["sadness"],
+        1: LABEL_TO_ID["joy"],
+        2: LABEL_TO_ID["love"],
+        3: LABEL_TO_ID["anger"],
+        4: LABEL_TO_ID["fear"],
+        5: LABEL_TO_ID["surprise"],
+        "sadness": LABEL_TO_ID["sadness"],
+        "joy": LABEL_TO_ID["joy"],
+        "love": LABEL_TO_ID["love"],
+        "anger": LABEL_TO_ID["anger"],
+        "fear": LABEL_TO_ID["fear"],
+        "surprise": LABEL_TO_ID["surprise"],
+    },
+
+    # 11. daily_dialog (0: no_emotion, 1: anger, 2: disgust, 3: fear, 4: happiness,
+    # 5: sadness, 6: surprise). Upstream source of silicone/dyda_e; trialled as its replacement
+    # and rejected -- it ships a loading script, which `datasets` v3+ refuses. Mapping retained
+    # in case a parquet mirror appears. Note the labels are per-utterance lists, which
+    # _map_single_example would need to flatten.
+    "daily_dialog": {
+        0: None,                            # no_emotion -- dominant class, dropped
+        1: LABEL_TO_ID["anger"],
+        2: None,                            # disgust -- no canonical counterpart
+        3: LABEL_TO_ID["fear"],
+        4: LABEL_TO_ID["joy"],              # happiness -> joy
+        5: LABEL_TO_ID["sadness"],
+        6: LABEL_TO_ID["surprise"],
+        "no_emotion": None,
+        "anger": LABEL_TO_ID["anger"],
+        "disgust": None,
+        "fear": LABEL_TO_ID["fear"],
+        "happiness": LABEL_TO_ID["joy"],
+        "sadness": LABEL_TO_ID["sadness"],
+        "surprise": LABEL_TO_ID["surprise"],
+    },
+
+    # 12. poem_sentiment: 0: negative, 1: positive, 2: no_impact, 3: mixed
     # NOTE: poem_sentiment is a sentiment dataset without fine-grained emotion labels.
     # We apply a rough proxy mapping: positive -> joy (1), negative -> sadness (0),
     # dropping ambiguous categories (no_impact, mixed).
@@ -527,7 +607,28 @@ def load_private_dataset(
 
     # Try candidate repository aliases (e.g. namespaced paths first, then legacy names)
     candidate_names = DATASET_ALIASES.get(hf_name, [hf_name])
+
+    # Guard: while a public KD/eval pool is in use, no private client dataset may resolve to it.
+    # In data-free mode there is no public pool, so the same corpus is a legitimate client
+    # dataset -- but say so out loud, because it is easy to misread later.
+    leaking = [c for c in candidate_names if c in PUBLIC_DATASET_SOURCES]
+    if leaking:
+        if config.is_public_set:
+            raise ValueError(
+                f"Client {client_id}'s dataset '{hf_name}' resolves to public-corpus path(s) "
+                f"{leaking}, which back the KD pool and evaluation holdout in "
+                f"mode='public_set'. Training on them leaks the evaluation set. Either remove "
+                f"them from DATASET_ALIASES or switch to mode='data_free_fd', where no public "
+                f"pool exists."
+            )
+        print(
+            f"  [NOTE] Client {client_id} uses '{hf_name}' -> {leaking}. This is the corpus that "
+            f"serves as the public pool in mode='public_set'; in mode='{config.mode}' no public "
+            f"pool is loaded, so it is being used purely as this client's private data."
+        )
+
     raw_data = None
+    resolved_name: Optional[str] = None
     last_error = None
 
     for cand_name in candidate_names:
@@ -535,10 +636,12 @@ def load_private_dataset(
         if hf_config is not None:
             try:
                 raw_data = load_dataset(cand_name, hf_config, token=config.hf_token)
+                resolved_name = cand_name
                 break
             except Exception:
                 try:
                     raw_data = load_dataset(cand_name, hf_config)
+                    resolved_name = cand_name
                     break
                 except Exception:
                     pass
@@ -546,10 +649,12 @@ def load_private_dataset(
         # 2. Try without sub-config (standard parquet root)
         try:
             raw_data = load_dataset(cand_name, token=config.hf_token)
+            resolved_name = cand_name
             break
         except Exception:
             try:
                 raw_data = load_dataset(cand_name)
+                resolved_name = cand_name
                 break
             except Exception as e_final:
                 last_error = e_final
@@ -560,6 +665,8 @@ def load_private_dataset(
             f"(config: {hf_config}) from candidate Hub paths {candidate_names}: {last_error}"
         )
         return None
+
+    logger.info(f"[Client {client_id}] Resolved '{hf_name}' -> Hub path '{resolved_name}'.")
 
     # Concatenate available splits (e.g. train + validation)
     if isinstance(raw_data, dict) or hasattr(raw_data, "keys"):
@@ -621,7 +728,38 @@ def load_private_dataset(
 
 
 # ---------------------------------------------------------------------------
-# 7. Package Exports
+# 7. Class Distribution Utilities
+# ---------------------------------------------------------------------------
+def compute_class_counts(
+    dataset: Optional[Dataset],
+    num_classes: int = NUM_CLASSES,
+) -> np.ndarray:
+    """Count examples per canonical class in a harmonized dataset.
+
+    Used by data-free aggregation (per-class logit / prototype weighting) and by the
+    client-coverage diagnostic. A class with a count of zero means the client contributes
+    no information about that class and must be excluded from its aggregation weight.
+
+    Args:
+        dataset: HF Dataset with an integer "label" column, or None.
+        num_classes: Size of the canonical label space.
+
+    Returns:
+        Integer array of shape (num_classes,) with per-class example counts.
+    """
+    counts = np.zeros(num_classes, dtype=np.int64)
+    if dataset is None or len(dataset) == 0:
+        return counts
+
+    labels = np.asarray(dataset["label"], dtype=np.int64)
+    valid = labels[(labels >= 0) & (labels < num_classes)]
+    if valid.size:
+        counts += np.bincount(valid, minlength=num_classes)[:num_classes]
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# 8. Package Exports
 # ---------------------------------------------------------------------------
 __all__ = [
     "CANONICAL_LABELS",
@@ -629,7 +767,10 @@ __all__ = [
     "ID_TO_LABEL",
     "NUM_CLASSES",
     "CLIENT_DATASETS",
+    "DATASET_ALIASES",
+    "PUBLIC_DATASET_SOURCES",
     "LABEL_MAPS",
     "load_public_dataset",
     "load_private_dataset",
+    "compute_class_counts",
 ]

@@ -27,6 +27,7 @@ if str(_parent_dir) not in sys.path:
 if str(_current_dir) not in sys.path:
     sys.path.insert(0, str(_current_dir))
 
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -35,9 +36,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset
+from tqdm import tqdm
 
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
+from federated_emotion.profiler import global_profiler
 from federated_emotion.config import Config
-from federated_emotion.data.loaders import CLIENT_DATASETS, NUM_CLASSES
+from federated_emotion.datafree import (
+    average_class_logits,
+    build_logit_targets,
+    collect_class_logits,
+    distillation_loss,
+)
+from federated_emotion.data.loaders import CLIENT_DATASETS, NUM_CLASSES, compute_class_counts
 from federated_emotion.models.wrapper import (
     CLIENT_MODELS,
     FederatedClassifier,
@@ -89,31 +104,48 @@ def run_client_round(
     client_id: int,
     round_num: int,
     config: Config,
-    public_kd_pool: Dataset,
-    public_eval_holdout: Dataset,
+    public_kd_pool: Optional[Dataset],
+    public_eval_holdout: Optional[Dataset],
     private_dataset: Dataset,
     avg_soft_labels: Optional[np.ndarray] = None,
     avg_soft_labels_from_server: Optional[np.ndarray] = None,
     cross_eval_datasets: Optional[Dict[str, Dataset]] = None,
+    local_eval_holdout: Optional[Dataset] = None,
+    global_class_logits: Optional[Dict[int, np.ndarray]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Execute a single local training and distillation round for an active client.
+
+    Behaviour depends on ``config.mode``:
+
+    - ``public_set``   distils against consensus soft labels defined over a shared public
+                      transfer pool, and reports accuracy on the public holdout.
+    - ``data_free_fd`` distils against the federation's per-class averaged logits, computed on
+                      the same forward pass as the supervised loss, and reports accuracy on this
+                      client's own local holdout. No public corpus is touched.
 
     Args:
         client_id: Client identifier (1-10 or 0-9).
         round_num: Current communication round index (1..num_rounds).
         config: Global pipeline Config dataclass instance.
-        public_kd_pool: Public transfer dataset for logit distillation averaging.
-        public_eval_holdout: Separate held-out Hugging Face Dataset for client evaluation.
+        public_kd_pool: Public transfer dataset. None in data-free mode.
+        public_eval_holdout: Public evaluation holdout. None in data-free mode.
         private_dataset: Local private Hugging Face Dataset with ["text", "label"].
-        avg_soft_labels: Consensus soft labels from server if KD active.
+        avg_soft_labels: Consensus soft labels from server (public_set mode only).
         avg_soft_labels_from_server: Alias for avg_soft_labels.
         cross_eval_datasets: Optional dictionary mapping dataset label names to holdout datasets.
+        local_eval_holdout: This client's own held-out slice. Used for eval_accuracy in
+            data-free mode, where no public holdout exists.
+        global_class_logits: Server-aggregated per-class logit vectors (data_free_fd mode only).
 
     Returns:
-        Dictionary containing client metrics, logits, eval accuracy, and cross-dataset matrix entries.
+        Dictionary containing client metrics, eval accuracy, cross-dataset matrix entries, and
+        either ``logits_on_kd_pool`` (public_set) or ``class_logits``/``class_counts``
+        (data_free_fd).
     """
     if avg_soft_labels is None and avg_soft_labels_from_server is not None:
         avg_soft_labels = avg_soft_labels_from_server
+
+    is_data_free = config.is_data_free
 
     model: Optional[FederatedClassifier] = None
 
@@ -128,9 +160,16 @@ def run_client_round(
         print(
             f"[Client {client_id:02d}] Communication Round {round_num}/{config.num_rounds}"
         )
+        print(f"  Mode               : {config.mode}")
         print(f"  Model Architecture : {model_id}")
         print(f"  Private Dataset    : {dataset_name} ({len(private_dataset)} examples)")
-        print(f"  KD Pool Size       : {len(public_kd_pool)} | Eval Holdout: {len(public_eval_holdout)}")
+        if is_data_free:
+            n_local = len(local_eval_holdout) if local_eval_holdout is not None else 0
+            print(f"  Transfer Set       : none (data-free) | Local Eval Holdout: {n_local}")
+        else:
+            print(
+                f"  KD Pool Size       : {len(public_kd_pool)} | Eval Holdout: {len(public_eval_holdout)}"
+            )
         print("=" * 80)
 
         # 2. Tokenizer initialization
@@ -167,52 +206,83 @@ def run_client_round(
             collate_fn=collate_private,
         )
 
-        # Add row index to public_kd_pool for aligned KD label lookup
-        indexed_kd_pool = public_kd_pool.map(
-            lambda ex, i: {"idx": i},
-            with_indices=True,
-            desc="Indexing KD pool",
-        )
-        collate_kd = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=True)
-        kd_loader = DataLoader(
-            indexed_kd_pool,
-            batch_size=config.batch_size_train,
-            shuffle=True,
-            collate_fn=collate_kd,
-        )
+        # The public KD pool exists only in public_set mode. In data-free mode the distillation
+        # targets are per-class vectors looked up by label, so no second loader is needed and no
+        # second forward pass is performed.
+        kd_loader = None
+        if not is_data_free:
+            # Add row index to public_kd_pool for aligned KD label lookup
+            indexed_kd_pool = public_kd_pool.map(
+                lambda ex, i: {"idx": i},
+                with_indices=True,
+                desc="Indexing KD pool",
+            )
+            collate_kd = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=True)
+            kd_loader = DataLoader(
+                indexed_kd_pool,
+                batch_size=config.batch_size_train,
+                shuffle=True,
+                collate_fn=collate_kd,
+            )
 
         # 5. Prepare Optimizer over trainable parameters (LoRA + Head)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if not trainable_params:
             raise ValueError(f"No trainable parameters found in model for client {client_id}.")
 
-        optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+        use_8bit = getattr(config, "optimizer_8bit", True) and HAS_BNB
+        if use_8bit:
+            try:
+                optimizer = bnb.optim.AdamW8bit(trainable_params, lr=config.learning_rate)
+                print(f"  -> Optimizer: bitsandbytes 8-bit AdamW")
+            except Exception as e_bnb:
+                logger.warning(f"Could not initialize 8-bit AdamW ({e_bnb}); falling back to torch.optim.AdamW")
+                optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+                print(f"  -> Optimizer: Standard AdamW (fallback due to {e_bnb})")
+        else:
+            optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+            print("  -> Optimizer: Standard AdamW" + (" (bitsandbytes not found)" if not HAS_BNB else ""))
+
         ce_loss_fn = nn.CrossEntropyLoss()
         kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
 
-        # Knowledge Distillation state
-        is_kd_active = (
-            round_num > config.kd_warmup_rounds
-            and avg_soft_labels_from_server is not None
-        )
-
+        # Knowledge Distillation state. Round <= kd_warmup_rounds trains purely locally, which
+        # makes round 1 a free local-only reference point in both modes.
+        past_warmup = round_num > config.kd_warmup_rounds
         teacher_soft_tensor: Optional[torch.Tensor] = None
-        if is_kd_active:
-            if isinstance(avg_soft_labels_from_server, np.ndarray):
-                teacher_soft_tensor = torch.tensor(
-                    avg_soft_labels_from_server, dtype=torch.float32, device=device
+        class_logit_store: Dict[int, List[torch.Tensor]] = defaultdict(list)
+
+        if is_data_free:
+            is_kd_active = past_warmup and bool(global_class_logits)
+            if is_kd_active:
+                print(
+                    f"  -> Data-free FD ACTIVE (lambda={config.fd_lambda}, "
+                    f"temperature={config.fd_temperature}, "
+                    f"classes available={sorted(global_class_logits.keys())})"
                 )
             else:
-                teacher_soft_tensor = avg_soft_labels_from_server.to(device=device, dtype=torch.float32)
-
-            print(
-                f"  -> Knowledge Distillation ACTIVE (lambda={config.kd_lambda}, "
-                f"temperature={config.kd_temperature})"
-            )
+                print("  -> Data-free FD INACTIVE (warmup round; local training only)")
         else:
-            print("  -> Knowledge Distillation INACTIVE (Warmup phase or round 1)")
+            is_kd_active = past_warmup and avg_soft_labels_from_server is not None
+            if is_kd_active:
+                if isinstance(avg_soft_labels_from_server, np.ndarray):
+                    teacher_soft_tensor = torch.tensor(
+                        avg_soft_labels_from_server, dtype=torch.float32, device=device
+                    )
+                else:
+                    teacher_soft_tensor = avg_soft_labels_from_server.to(
+                        device=device, dtype=torch.float32
+                    )
+
+                print(
+                    f"  -> Knowledge Distillation ACTIVE (lambda={config.kd_lambda}, "
+                    f"temperature={config.kd_temperature})"
+                )
+            else:
+                print("  -> Knowledge Distillation INACTIVE (Warmup phase or round 1)")
 
         # 6. Local Training Epochs
+        global_profiler.start("Client_Local_Training")
         model.train()
         for epoch in range(1, config.local_epochs + 1):
             total_ce_loss = 0.0
@@ -220,10 +290,15 @@ def run_client_round(
             total_combined_loss = 0.0
             num_steps = 0
 
-            # Interleave private batches with KD batches
-            kd_iter = itertools.cycle(kd_loader) if is_kd_active else None
+            # Interleave private batches with KD batches (public_set mode only)
+            kd_iter = (
+                itertools.cycle(kd_loader)
+                if (is_kd_active and not is_data_free and kd_loader is not None)
+                else None
+            )
 
-            for batch_priv in train_loader:
+            pbar = tqdm(train_loader, desc=f"  Epoch [{epoch:02d}/{config.local_epochs:02d}]", leave=False)
+            for batch_priv in pbar:
                 optimizer.zero_grad()
 
                 # A. Supervised Task Loss
@@ -235,9 +310,24 @@ def run_client_round(
                 loss_ce = ce_loss_fn(logits_priv, labels)
                 loss = loss_ce
 
-                # B. Knowledge Distillation Loss
+                # B. Distillation Loss
                 loss_kd = torch.tensor(0.0, device=device)
-                if is_kd_active and kd_iter is not None and teacher_soft_tensor is not None:
+
+                if is_data_free:
+                    # Per-class logit distillation. Reuses the forward pass above, so there is
+                    # no second pass through the backbone. The upload payload is collected here
+                    # for free, on every step, warmup included.
+                    collect_class_logits(logits_priv, labels, class_logit_store)
+
+                    if is_kd_active:
+                        target = build_logit_targets(logits_priv, labels, global_class_logits)
+                        if target is not None:
+                            loss_kd = distillation_loss(
+                                logits_priv, target, config.fd_temperature
+                            )
+                            loss = loss + (config.fd_lambda * loss_kd)
+
+                elif is_kd_active and kd_iter is not None and teacher_soft_tensor is not None:
                     batch_kd = next(kd_iter)
                     kd_input_ids = batch_kd["input_ids"].to(device)
                     kd_attention_mask = batch_kd["attention_mask"].to(device)
@@ -269,33 +359,74 @@ def run_client_round(
                 f"Loss Total: {avg_total:.4f} | CE: {avg_ce:.4f}"
                 + (f" | KD: {avg_kd:.4f}" if is_kd_active else "")
             )
+        global_profiler.stop("Client_Local_Training")
 
-        # 7. Post-Training Inference on Public KD Pool (no_grad)
+        # 7. Build the upload payload
         model.eval()
-        print("  -> Generating client logits over public KD pool...")
-        infer_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
-        kd_infer_loader = DataLoader(
-            public_kd_pool,
-            batch_size=config.batch_size_infer,
-            shuffle=False,
-            collate_fn=infer_collate,
-        )
+        logits_on_kd_pool: Optional[np.ndarray] = None
+        class_logits: Optional[Dict[int, np.ndarray]] = None
+        class_counts = np.zeros(config.num_classes, dtype=np.int64)
 
-        kd_logits_list: List[np.ndarray] = []
-        with torch.no_grad():
-            for batch_kd_infer in kd_infer_loader:
-                input_ids = batch_kd_infer["input_ids"].to(device)
-                attention_mask = batch_kd_infer["attention_mask"].to(device)
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                kd_logits_list.append(logits.detach().cpu().to(torch.float32).numpy())
+        if is_data_free:
+            # Already collected during training -- no extra forward passes at all.
+            global_profiler.start("Client_Class_Logits")
+            class_logits = average_class_logits(class_logit_store)
 
-        logits_on_kd_pool: np.ndarray = np.concatenate(kd_logits_list, axis=0)
+            # Counts come from the dataset, NOT from len(class_logit_store[c]). The store holds
+            # one entry per example *per epoch*, so its lengths are local_epochs x the true
+            # counts. That scaling is uniform here and would cancel in the normalized weights,
+            # but it would be wrong the moment epochs differ per client, and it makes the
+            # logged numbers misleading either way.
+            class_counts = compute_class_counts(private_dataset, config.num_classes)
 
-        # 8. Client Evaluation on Public Eval Holdout
-        print("  -> Evaluating on public eval holdout...")
+            held = sorted(class_logits.keys())
+            print(
+                f"  -> Per-class logits ready for {len(held)} class(es) {held}; "
+                f"upload = {len(held) * config.num_classes * 4} bytes"
+            )
+            if len(held) < config.num_classes:
+                absent = [c for c in range(config.num_classes) if c not in class_logits]
+                print(f"     [NOTE] this client holds no examples of class(es) {absent}")
+            global_profiler.stop("Client_Class_Logits")
+        else:
+            global_profiler.start("Client_KD_Inference")
+            print("  -> Generating client logits over public KD pool...")
+            infer_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
+            kd_infer_loader = DataLoader(
+                public_kd_pool,
+                batch_size=config.batch_size_infer,
+                shuffle=False,
+                collate_fn=infer_collate,
+            )
+
+            kd_logits_list: List[np.ndarray] = []
+            with torch.no_grad():
+                for batch_kd_infer in kd_infer_loader:
+                    input_ids = batch_kd_infer["input_ids"].to(device)
+                    attention_mask = batch_kd_infer["attention_mask"].to(device)
+                    logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                    kd_logits_list.append(logits.detach().cpu().to(torch.float32).numpy())
+
+            logits_on_kd_pool = np.concatenate(kd_logits_list, axis=0)
+            global_profiler.stop("Client_KD_Inference")
+
+        # 8. Client Evaluation
+        # public_set   -> the shared public holdout
+        # data_free_fd -> this client's own held-out slice, so no public corpus is involved
+        global_profiler.start("Client_Local_Eval")
+        eval_dataset = local_eval_holdout if is_data_free else public_eval_holdout
+        eval_source = "own local holdout" if is_data_free else "public eval holdout"
+
+        if eval_dataset is None or len(eval_dataset) == 0:
+            raise ValueError(
+                f"Client {client_id}: no evaluation set available for mode '{config.mode}'. "
+                f"Expected {'local_eval_holdout' if is_data_free else 'public_eval_holdout'}."
+            )
+
+        print(f"  -> Evaluating on {eval_source} ({len(eval_dataset)} examples)...")
         eval_collate = _create_collate_fn(tokenizer, config.max_seq_length, include_idx=False)
         eval_loader = DataLoader(
-            public_eval_holdout,
+            eval_dataset,
             batch_size=config.batch_size_infer,
             shuffle=False,
             collate_fn=eval_collate,
@@ -319,10 +450,12 @@ def run_client_round(
             f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% "
             f"({total_correct}/{total_eval_samples})"
         )
+        global_profiler.stop("Client_Local_Eval")
 
         # 9. Cross-Dataset Evaluation across all client dataset holdouts
         cross_eval_accuracies: Dict[str, float] = {}
         if cross_eval_datasets:
+            global_profiler.start("Client_Cross_Eval")
             with torch.no_grad():
                 for ds_key, ds_slice in cross_eval_datasets.items():
                     if len(ds_slice) == 0:
@@ -344,6 +477,7 @@ def run_client_round(
                         c_corr += (c_preds == c_lab).sum().item()
                         c_tot += c_lab.size(0)
                     cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
+            global_profiler.stop("Client_Cross_Eval")
 
         # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (
@@ -358,15 +492,21 @@ def run_client_round(
 
         return {
             "client_id": client_id,
-            "logits_on_kd_pool": logits_on_kd_pool,
+            "mode": config.mode,
             "eval_accuracy": eval_accuracy,
             "cross_eval_accuracies": cross_eval_accuracies,
+            # --- public_set payload (None in data-free mode) ---
+            "logits_on_kd_pool": logits_on_kd_pool,
+            # --- data_free_fd payload (None in public_set mode) ---
+            "class_logits": class_logits,
+            "class_counts": class_counts,
             # --- Comprehensive metrics for detailed CSV output ---
             "model_id": model_id,
             "dataset_name": dataset_name,
             "num_private_examples": len(private_dataset),
-            "num_kd_pool": len(public_kd_pool),
-            "num_eval_holdout": len(public_eval_holdout),
+            "num_kd_pool": 0 if is_data_free else len(public_kd_pool),
+            "num_eval_holdout": len(eval_dataset),
+            "eval_source": eval_source,
             "num_train_steps": num_steps,
             "local_epochs": config.local_epochs,
             "avg_ce_loss": avg_ce,
