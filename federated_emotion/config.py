@@ -102,6 +102,12 @@ class Config:
     # --- Federation mode ---------------------------------------------------
     #: One of SUPPORTED_MODES. Defaults to the original public-transfer-set method so that
     #: pre-existing config.yaml files behave exactly as before.
+    dataset_mode: str = "legacy"
+
+    @property
+    def is_dbpedia(self) -> bool:
+        return self.dataset_mode == "dbpedia"
+
     mode: str = "public_set"
 
     # --- data_free_fd parameters (ignored when mode == "public_set") -------
@@ -211,6 +217,7 @@ class Config:
             sparse_training=sparse_training_cfg,
             optimizer_8bit=bool(data.get("optimizer_8bit", True)),
             mode=mode,
+            dataset_mode=str(data.get("dataset_mode", "legacy")),
             fd_lambda=float(data.get("fd_lambda", 1.0)),
             fd_temperature=float(data.get("fd_temperature", 2.0)),
             fd_weight_by_count=bool(data.get("fd_weight_by_count", True)),

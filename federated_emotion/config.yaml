@@ -15,6 +15,7 @@
 
 # mode: "public_set"
 mode: "data_free_fd"
+dataset_mode: "dbpedia"
 
 # ---------------------------------------------------------------------------
 # clients

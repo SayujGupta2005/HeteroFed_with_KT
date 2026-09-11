@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 from transformers import (
+    AutoModelForSequenceClassification,
     AutoConfig,
     AutoModel,
     AutoTokenizer,
@@ -60,6 +61,15 @@ logger = logging.getLogger(__name__)
 #
 # Under mode="data_free_fd" only [num_classes] logit vectors are exchanged, so differing hidden
 # sizes and depths across families cost nothing -- no feature_dim alignment or projection needed.
+
+DBPEDIA_BERT_MODELS = [
+    "bert-base-uncased",
+    "roberta-base",
+    "distilbert-base-uncased",
+    "albert-base-v2",
+    "google/electra-base-discriminator"
+]
+
 CLIENT_MODELS: Dict[int, str] = {
     1: "microsoft/Phi-3.5-mini-instruct",              # Phi-3     3.8B  hidden 3072
     2: "Qwen/Qwen2.5-3B-Instruct",                     # Qwen2.5   3B    hidden 2048
@@ -77,7 +87,9 @@ CLIENT_MODELS: Dict[int, str] = {
 DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-3B"       # Default for client IDs beyond registry (3-4B tier)
 
 
-def get_model_for_client(client_id: int) -> str:
+def get_model_for_client(client_id: int, config: Config = None) -> str:
+    if config and getattr(config, 'is_dbpedia', False):
+        return DBPEDIA_BERT_MODELS[client_id % len(DBPEDIA_BERT_MODELS)]
     """Return model identifier for client_id (1-indexed or 0-indexed), with default fallback."""
     if client_id in CLIENT_MODELS:
         return CLIENT_MODELS[client_id]
@@ -201,6 +213,13 @@ class FederatedClassifier(nn.Module):
         """
         super().__init__()
         self.model_id = model_id
+
+        if getattr(config, 'is_dbpedia', False):
+            self.backbone = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=num_labels, ignore_mismatched_sizes=True)
+            self.hidden_size = self.backbone.config.hidden_size if hasattr(self.backbone.config, "hidden_size") else 768
+            self.head = None # Handled by backbone
+            return
+    
         self.num_labels = num_labels
         self.config = config
 

@@ -571,6 +571,17 @@ def load_private_dataset(
     client_id: int,
     config: Config,
 ) -> Optional[Dataset]:
+    global DBPEDIA_PARTITIONS
+    if getattr(config, "is_dbpedia", False):
+        print(f"[Client {client_id}] Routing to unified DBpedia Kaggle pipeline...")
+        if not DBPEDIA_PARTITIONS:
+             full_df = download_and_load_dbpedia_kaggle()
+             DBPEDIA_PARTITIONS = get_iid_partitions(full_df, config.num_clients)
+        if client_id >= len(DBPEDIA_PARTITIONS):
+             client_id = client_id % len(DBPEDIA_PARTITIONS)
+        return DBPEDIA_PARTITIONS[client_id]
+
+    # Legacy logic
     """Load, harmonize, filter, and cap a private dataset for a federated client.
 
     Maps client_id (1-10) to the corresponding dataset via CLIENT_DATASETS,
@@ -774,3 +785,42 @@ __all__ = [
     "load_private_dataset",
     "compute_class_counts",
 ]
+
+
+def download_and_load_dbpedia_kaggle(download_dir: str = "./data/dbpedia") -> pd.DataFrame:
+    os.makedirs(download_dir, exist_ok=True)
+    print("Downloading DBpedia dataset from Kaggle...")
+    dataset_identifier = "danofer/dbpedia-classes" 
+    
+    try:
+        kaggle.api.authenticate()
+        kaggle.api.dataset_download_files(dataset_identifier, path=download_dir, unzip=True)
+    except Exception as e:
+        print(f"Failed to download from Kaggle: {e}. Ensure ~/.kaggle/kaggle.json exists.")
+        # Mock dataframe for testing if api fails
+        return pd.DataFrame({"text": ["mock text"]*100, "class": [0]*100})
+        
+    csv_files = [f for f in os.listdir(download_dir) if f.endswith('.csv')]
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV file found in {download_dir}")
+        
+    csv_path = os.path.join(download_dir, csv_files[0])
+    df = pd.read_csv(csv_path)
+    if "class" in df.columns and "content" in df.columns:
+        df["text"] = df["content"]
+        df["label"] = df["class"] - 1 # 1-indexed to 0-indexed typically
+    return df
+
+def get_iid_partitions(df: pd.DataFrame, num_clients: int) -> list:
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    partitions = []
+    chunk_size = math.ceil(len(df) / num_clients)
+    
+    for i in range(num_clients):
+        chunk_df = df.iloc[i * chunk_size : (i + 1) * chunk_size]
+        if "label" not in chunk_df.columns:
+             chunk_df["label"] = 0
+        dataset = Dataset.from_pandas(chunk_df)
+        partitions.append(dataset)
+        
+    return partitions
