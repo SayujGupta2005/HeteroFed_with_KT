@@ -114,6 +114,25 @@ class Config:
     #: class the same vote as one holding 3000. Set False to reproduce the reference.
     fd_weight_by_count: bool = True
 
+    # --- reliability-weighted aggregation ---------------------------------
+    # Count weighting measures data volume, not competence. Reliability uses shrunk per-class accuracy
+    # on the client's own holdout to measure competence against ground truth, avoiding self-reinforcement.
+    #
+    #   w_k^c  proportional to  (n_k^c ** fd_count_exponent) * (r_k^c ** fd_reliability_exponent)
+    #
+    #: Exponent on the count factor. 1.0 = raw count, 0.5 = sqrt damping, 0.0 = ignored.
+    fd_count_exponent: float = 1.0
+    #: Enable reliability factor. False = pure count weighting.
+    fd_use_reliability: bool = True
+    #: Exponent on reliability. 0.0 disables it.
+    fd_reliability_exponent: float = 1.0
+    #: Empirical-Bayes pseudo-count for shrinking per-class accuracy toward overall accuracy.
+    #: Prevents accidental 0.0/1.0 scores for rare classes. 0 = no shrinkage.
+    fd_reliability_prior: float = 5.0
+    #: Optional factor 1/(1 + mean per-class FD loss). CAUTION: self-reinforcing; agreeing
+    #: clients gain influence. Keep False unless ablating.
+    fd_use_loss_term: bool = False
+
     #: Maximum size of each client's own held-out slice, carved off the tail of its private
     #: dataset. In data_free_fd mode this is the ONLY evaluation set a client has, so the old
     #: hard-coded 50 (~8 examples per class over 6 classes) was far too small to read.
@@ -214,6 +233,11 @@ class Config:
             fd_lambda=float(data.get("fd_lambda", 1.0)),
             fd_temperature=float(data.get("fd_temperature", 2.0)),
             fd_weight_by_count=bool(data.get("fd_weight_by_count", True)),
+            fd_count_exponent=float(data.get("fd_count_exponent", 1.0)),
+            fd_use_reliability=bool(data.get("fd_use_reliability", False)),
+            fd_reliability_exponent=float(data.get("fd_reliability_exponent", 1.0)),
+            fd_reliability_prior=float(data.get("fd_reliability_prior", 5.0)),
+            fd_use_loss_term=bool(data.get("fd_use_loss_term", False)),
             local_holdout_size=int(data.get("local_holdout_size", 200)),
         )
 

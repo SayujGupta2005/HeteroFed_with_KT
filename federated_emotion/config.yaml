@@ -12,8 +12,6 @@
 #                 scored on their own held-out slices. Uses fd_* settings.
 #                 Upload is num_classes^2 floats per client per round -- 144 bytes for 6
 #                 classes. Only one forward pass per training step, versus two in public_set.
-
-# mode: "public_set"
 mode: "data_free_fd"
 
 # ---------------------------------------------------------------------------
@@ -65,6 +63,18 @@ fd_weight_by_count: true         # weight client k's class-c logit by its class-
                                  # count. false reproduces the reference unweighted mean, in
                                  # which sem_eval's 13 'love' examples carry the same vote as
                                  # go_emotions' 475.
+
+# Reliability-weighted aggregation.
+#   w_k^c  proportional to  (n_k^c ** fd_count_exponent) * (r_k^c ** fd_reliability_exponent)
+# r_k^c is shrunk per-class accuracy on client's own holdout. Measures competence against
+# ground truth, not consensus. Separates clients with equal counts but different accuracy.
+fd_count_exponent: 1.0           # 1.0=raw, 0.5=sqrt damping, 0.0=ignored
+fd_use_reliability: true         # false = pure count weighting
+fd_reliability_exponent: 1.0     # 0.0 disables it
+fd_reliability_prior: 5.0        # Empirical-Bayes pseudo-count; prevents accidental 0/1
+                                 # accuracy for rare classes.
+fd_use_loss_term: false          # 1/(1+per-class FD loss). CAUTION: self-reinforcing;
+                                 # use for ablation only.
 
 # ---------------------------------------------------------------------------
 # mode: public_set  -- shared public transfer pool

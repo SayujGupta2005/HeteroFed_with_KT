@@ -47,9 +47,11 @@ except ImportError:
 from federated_emotion.profiler import global_profiler
 from federated_emotion.config import Config
 from federated_emotion.datafree import (
+    accumulate_class_losses,
     average_class_logits,
     build_logit_targets,
     collect_class_logits,
+    compute_reliability,
     distillation_loss,
 )
 from federated_emotion.data.loaders import CLIENT_DATASETS, NUM_CLASSES, compute_class_counts
@@ -251,6 +253,8 @@ def run_client_round(
         past_warmup = round_num > config.kd_warmup_rounds
         teacher_soft_tensor: Optional[torch.Tensor] = None
         class_logit_store: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        # Per-class distillation difficulty for aggregation loss factor.
+        class_loss_store: Dict[int, List[float]] = defaultdict(list)
 
         if is_data_free:
             is_kd_active = past_warmup and bool(global_class_logits)
@@ -322,9 +326,13 @@ def run_client_round(
                     if is_kd_active:
                         target = build_logit_targets(logits_priv, labels, global_class_logits)
                         if target is not None:
-                            loss_kd = distillation_loss(
-                                logits_priv, target, config.fd_temperature
+                            loss_kd, per_ex_kd = distillation_loss(
+                                logits_priv,
+                                target,
+                                config.fd_temperature,
+                                return_per_example=True,
                             )
+                            accumulate_class_losses(per_ex_kd, labels, class_loss_store)
                             loss = loss + (config.fd_lambda * loss_kd)
 
                 elif is_kd_active and kd_iter is not None and teacher_soft_tensor is not None:
@@ -366,6 +374,8 @@ def run_client_round(
         logits_on_kd_pool: Optional[np.ndarray] = None
         class_logits: Optional[Dict[int, np.ndarray]] = None
         class_counts = np.zeros(config.num_classes, dtype=np.int64)
+        # NaN marks no measurement (warmup or missing class); skipped by aggregate_class_logits.
+        class_losses = np.full(config.num_classes, np.nan, dtype=np.float64)
 
         if is_data_free:
             # Already collected during training -- no extra forward passes at all.
@@ -378,6 +388,10 @@ def run_client_round(
             # but it would be wrong the moment epochs differ per client, and it makes the
             # logged numbers misleading either way.
             class_counts = compute_class_counts(private_dataset, config.num_classes)
+
+            for cls, vals in class_loss_store.items():
+                if vals and 0 <= int(cls) < config.num_classes:
+                    class_losses[int(cls)] = float(np.mean(vals))
 
             held = sorted(class_logits.keys())
             print(
@@ -434,6 +448,11 @@ def run_client_round(
 
         total_correct = 0
         total_eval_samples = 0
+        # Tallies for reliability weight and per-class F1 reporting.
+        eval_correct_per_class = np.zeros(config.num_classes, dtype=np.int64)
+        eval_total_per_class = np.zeros(config.num_classes, dtype=np.int64)
+        eval_pred_per_class = np.zeros(config.num_classes, dtype=np.int64)
+
         with torch.no_grad():
             for batch_eval in eval_loader:
                 input_ids = batch_eval["input_ids"].to(device)
@@ -445,11 +464,46 @@ def run_client_round(
                 total_correct += (preds == labels).sum().item()
                 total_eval_samples += labels.size(0)
 
+                lab_cpu = labels.detach().cpu().numpy()
+                pred_cpu = preds.detach().cpu().numpy()
+                for c in range(config.num_classes):
+                    lab_c = lab_cpu == c
+                    eval_total_per_class[c] += int(lab_c.sum())
+                    eval_pred_per_class[c] += int((pred_cpu == c).sum())
+                    eval_correct_per_class[c] += int((lab_c & (pred_cpu == c)).sum())
+
         eval_accuracy = float(total_correct / max(total_eval_samples, 1))
         print(
             f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% "
             f"({total_correct}/{total_eval_samples})"
         )
+
+        # Per-class F1: 2*TP / (2*TP + FP + FN). Reported to detect rare-class failure.
+        per_class_f1 = np.zeros(config.num_classes, dtype=np.float64)
+        for c in range(config.num_classes):
+            denom = eval_pred_per_class[c] + eval_total_per_class[c]
+            per_class_f1[c] = (2.0 * eval_correct_per_class[c] / denom) if denom > 0 else 0.0
+        macro_f1 = float(per_class_f1[eval_total_per_class > 0].mean()) if (eval_total_per_class > 0).any() else 0.0
+
+        reliability = compute_reliability(
+            eval_correct_per_class,
+            eval_total_per_class,
+            eval_accuracy,
+            prior_strength=config.fd_reliability_prior,
+            num_classes=config.num_classes,
+        )
+
+        if is_data_free:
+            held = [c for c in range(config.num_classes) if eval_total_per_class[c] > 0]
+            print(
+                "     per-class acc (shrunk) : "
+                + ", ".join(f"{c}={reliability[c]:.3f}" for c in range(config.num_classes))
+            )
+            print(
+                "     per-class F1           : "
+                + ", ".join(f"{c}={per_class_f1[c]:.3f}" for c in held)
+                + f"  | macro-F1 {macro_f1:.3f}"
+            )
         global_profiler.stop("Client_Local_Eval")
 
         # 9. Cross-Dataset Evaluation across all client dataset holdouts
@@ -500,6 +554,13 @@ def run_client_round(
             # --- data_free_fd payload (None in public_set mode) ---
             "class_logits": class_logits,
             "class_counts": class_counts,
+            # Reliability signals from local holdout for weighted aggregation.
+            "reliability": reliability,
+            "class_losses": class_losses,
+            "eval_correct_per_class": eval_correct_per_class,
+            "eval_total_per_class": eval_total_per_class,
+            "per_class_f1": per_class_f1,
+            "macro_f1": macro_f1,
             # --- Comprehensive metrics for detailed CSV output ---
             "model_id": model_id,
             "dataset_name": dataset_name,

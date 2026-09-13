@@ -73,7 +73,7 @@ ROUND r
 │    └─ save LoRA adapter + head
 │
 ├─ SERVER: for each class c, average the vectors from the clients that hold c,
-│          weighted by their class-c example counts
+│          weighted by data count, reliability, and optional loss
 │
 └─ broadcast → next round's distillation targets
 ```
@@ -197,10 +197,11 @@ provenance stays legible and any of them can be reinstated if a parquet mirror a
 
 Both are switchable, so each is a clean ablation row.
 
-### Count-weighted aggregation — `fd_weight_by_count: true`
+### Reliability-weighted aggregation — `fd_use_reliability: true`
 
-The reference takes an unweighted mean across the clients holding each class. That gives a client
-with 13 examples of a class the same vote as one with 475. Weighting by count fixes it:
+Beyond simple count-weighting, we implement a reliability factor based on shrunk per-class accuracy
+on the client's own holdout. This separates clients with equal data counts but different competence.
+The weight follows: `w ∝ (count^exp) * (reliability^exp) * loss_factor`.
 
 ```
 'love'      client 1  475 ex →  71.1%   (unweighted: 33.3%)
@@ -263,6 +264,9 @@ sparse_training:
 fd_lambda: 1.0                # weight of the per-class distillation term
 fd_temperature: 2.0
 fd_weight_by_count: true
+fd_use_reliability: true      # competence-based weighting
+fd_count_exponent: 1.0
+fd_reliability_exponent: 1.0
 
 kd_warmup_rounds: 1           # round 1 is local-only → your free baseline
 local_holdout_size: 200       # per-client eval slice; the ONLY eval set in this mode
@@ -278,6 +282,8 @@ Ignored in this mode: `kd_lambda`, `kd_temperature`, `aggregation_mode`,
 |---|---|
 `quant_bits` | Must be **4** or 8 for NF4. `16` silently disables quantization; the manifest now says so explicitly instead of printing the meaningless `"16-bit NF4"`. |
 `sparse_training.enabled` | When true, `reduced_rank` replaces `lora_rank` everywhere. The manifest reports the *effective* rank — it previously printed `lora_rank` regardless, misreporting every sparse run. |
+| `fd_use_reliability` | Uses shrunk per-class accuracy to weight contributions; prevents "lucky" rare-class holders from dominating. |
+| `fd_reliability_prior` | Empirical-Bayes pseudo-count; prevents accidental 0.0/1.0 scores for rare classes. |
 `local_holdout_size` | This is the only evaluation set each client has. The former hard-coded 50 gave ~8 examples per class over 6 classes — far too few to read. |
 `fd_lambda` | `0` reduces the run to pure local training on every round, i.e. a full local baseline. |
 

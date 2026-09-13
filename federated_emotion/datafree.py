@@ -84,23 +84,36 @@ def average_class_logits(
 def aggregate_class_logits(
     client_logits: Sequence[Optional[Dict[int, np.ndarray]]],
     class_counts: Optional[Sequence[np.ndarray]] = None,
+    reliability: Optional[Sequence[Optional[np.ndarray]]] = None,
+    class_losses: Optional[Sequence[Optional[np.ndarray]]] = None,
+    count_exponent: float = 1.0,
+    reliability_exponent: float = 1.0,
     num_classes: int = 6,
+    client_ids: Optional[Sequence[int]] = None,
     verbose: bool = True,
 ) -> Optional[Dict[int, np.ndarray]]:
-    """Average per-class logit vectors across clients.
+    """Aggregate per-class logit vectors across clients with optional reliability correction.
 
-    A client contributes to class c only if it actually holds examples of class c. When
-    class_counts is supplied, contributions are weighted by those counts so that a client with
-    a handful of examples cannot outvote one with hundreds.
+    # Weight w_k^c proportional to (n_k^c ** count_exponent) * (r_k^c ** reliability_exponent) * L_k^c
+    # where n_k^c is example count, r_k^c is shrunk accuracy, and L_k^c is optional 1/(1+FD loss).
+    # Reliability separates clients with equal counts but different competence.
+
+    # Ablation: count_exp=1, rel_exp=0 is baseline; count_exp=0, rel_exp=0 is unweighted;
+    # count_exp=0.5 is sqrt damping.
+
+    # Caution: loss-based weighting is self-reinforcing. Reliability is ground-truth based
+    # and avoids this. Use class_losses for ablation only.
 
     Args:
-        client_logits: Per-client mappings from average_class_logits. None entries (failed
-            clients) are skipped.
-        class_counts: Optional per-client arrays of shape (num_classes,) giving each client's
-            example count per class. Must align positionally with client_logits. Pass None for
-            the reference unweighted mean.
+        client_logits: Per-client mappings from average_class_logits. None skipped.
+        class_counts: Per-client example counts. None gives unweighted mean.
+        reliability: Per-client reliability arrays. None disables reliability factor.
+        class_losses: Per-client mean FD loss. None disables loss factor.
+        count_exponent: Exponent on the count factor.
+        reliability_exponent: Exponent on the reliability factor.
         num_classes: Size of the canonical label space.
-        verbose: Print the per-class weight allocation.
+        client_ids: Optional real client ids for logging; defaults to positional indices.
+        verbose: Print per-class weight allocation and decomposition.
 
     Returns:
         Mapping class id -> aggregated logit vector, or None if no client contributed anything.
@@ -108,49 +121,100 @@ def aggregate_class_logits(
     buckets: Dict[int, List[np.ndarray]] = defaultdict(list)
     weights: Dict[int, List[float]] = defaultdict(list)
     owners: Dict[int, List[int]] = defaultdict(list)
+    # Tracks weight factors for logging.
+    factors: Dict[int, List[Dict[str, float]]] = defaultdict(list)
+
+    use_reliability = reliability is not None and reliability_exponent != 0.0
+    use_losses = class_losses is not None
 
     for k, per_client in enumerate(client_logits):
         if not per_client:
             continue
         counts = class_counts[k] if class_counts is not None else None
+        rel = reliability[k] if use_reliability else None
+        loss = class_losses[k] if use_losses else None
+
         for cls, vec in per_client.items():
-            if not (0 <= int(cls) < num_classes):
+            c = int(cls)
+            if not (0 <= c < num_classes):
                 continue
-            w = float(counts[int(cls)]) if counts is not None else 1.0
-            if w <= 0.0:
+
+            n = float(counts[c]) if counts is not None else 1.0
+            if counts is not None and n <= 0.0:
                 # Client reported a vector for a class its count says it does not hold.
                 # Trust the count and drop the contribution.
                 continue
-            buckets[int(cls)].append(np.asarray(vec, dtype=np.float32))
-            weights[int(cls)].append(w)
-            owners[int(cls)].append(k)
+
+            w_count = (n ** float(count_exponent)) if counts is not None else 1.0
+
+            w_rel = 1.0
+            if rel is not None:
+                # Floor at 1e-3: prevents a single bad round from permanently silencing
+                # the only holder of a rare class.
+                r = float(np.clip(rel[c], 1e-3, 1.0))
+                w_rel = r ** float(reliability_exponent)
+
+            w_loss = 1.0
+            if loss is not None and np.isfinite(loss[c]):
+                w_loss = 1.0 / (1.0 + max(float(loss[c]), 0.0))
+
+            w = w_count * w_rel * w_loss
+            if w <= 0.0:
+                continue
+
+            buckets[c].append(np.asarray(vec, dtype=np.float32))
+            weights[c].append(w)
+            owners[c].append(k)
+            factors[c].append({"n": n, "count": w_count, "rel": w_rel, "loss": w_loss})
 
     if not buckets:
         print("\n[WARNING] Data-free aggregation: no client contributed any class logits.")
         return None
 
     global_logits: Dict[int, np.ndarray] = {}
+    normalised: Dict[int, np.ndarray] = {}
     for cls in sorted(buckets):
         w = np.asarray(weights[cls], dtype=np.float64)
         w = w / max(w.sum(), 1e-12)
+        normalised[cls] = w
         stacked = np.stack(buckets[cls], axis=0)
         global_logits[cls] = (stacked * w[:, None]).sum(axis=0).astype(np.float32)
 
     if verbose:
-        mode = "count-weighted" if class_counts is not None else "unweighted (reference FD)"
-        print("\n" + "-" * 70)
+        if class_counts is None:
+            mode = "unweighted (reference FD)"
+        else:
+            # Resolve aggregation mode label for logging.
+            bits = [f"count^{count_exponent:g}"]
+            if use_reliability:
+                bits.append(f"reliability^{reliability_exponent:g}")
+            if use_losses:
+                bits.append("1/(1+loss)")
+            mode = " x ".join(bits)
+
+        def label(idx: int) -> str:
+            return f"c{client_ids[idx]}" if client_ids is not None else f"c{idx}"
+
+        print("\n" + "-" * 78)
         print(f"[Server] Data-free per-class logit aggregation ({mode})")
         for cls in sorted(buckets):
-            w = np.asarray(weights[cls], dtype=np.float64)
-            w = w / max(w.sum(), 1e-12)
-            parts = ", ".join(
-                f"c{owners[cls][i]}={w[i] * 100:.1f}%" for i in range(len(w))
-            )
-            print(f"  class {cls}: {len(w)} contributor(s) | {parts}")
+            w = normalised[cls]
+            print(f"  class {cls}: {len(w)} contributor(s)")
+            for i in range(len(w)):
+                f = factors[cls][i]
+                extra = ""
+                if use_reliability:
+                    extra += f" rel={f['rel'] ** (1.0 / max(reliability_exponent, 1e-9)):.3f}"
+                if use_losses:
+                    extra += f" loss_factor={f['loss']:.3f}"
+                print(
+                    f"      {label(owners[cls][i]):<6} n={int(f['n']):>4}"
+                    f"{extra}  ->  weight {w[i] * 100:5.1f}%"
+                )
         missing = [c for c in range(num_classes) if c not in global_logits]
         if missing:
             print(f"  [WARNING] no client holds class(es) {missing}; they cannot be learned.")
-        print("-" * 70)
+        print("-" * 78)
 
     return global_logits
 
@@ -197,24 +261,89 @@ def distillation_loss(
     output: torch.Tensor,
     target: torch.Tensor,
     temperature: float = 2.0,
+    return_per_example: bool = False,
 ) -> torch.Tensor:
-    """Temperature-scaled KL divergence from the federation's per-class targets.
+    """Temperature-scaled KL divergence from per-class targets.
 
-    The T**2 factor restores the gradient magnitude that dividing the logits by T removes, so
-    the loss weight means the same thing at any temperature (Hinton et al., 2015).
+    # T**2 restores gradient magnitude after dividing logits by T (Hinton et al., 2015).
 
     Args:
         output: Student logits of shape (batch, num_classes).
         target: Detached teacher logits of the same shape, from build_logit_targets.
         temperature: Softmax temperature. Must be positive.
+        return_per_example: If True, return un-reduced divergence to attribute
+            difficulty per class. No extra compute cost.
 
     Returns:
-        Scalar loss.
+        Scalar loss, or (scalar loss, per-example loss of shape (batch,)).
     """
     t = max(float(temperature), 1e-8)
     student_log_probs = F.log_softmax(output / t, dim=-1)
     teacher_probs = F.softmax(target / t, dim=-1)
-    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (t ** 2)
+
+    per_example = F.kl_div(
+        student_log_probs, teacher_probs, reduction="none"
+    ).sum(dim=-1) * (t ** 2)
+    scalar = per_example.mean()
+
+    if return_per_example:
+        return scalar, per_example.detach()
+    return scalar
+
+
+def accumulate_class_losses(
+    per_example_loss: torch.Tensor,
+    labels: torch.Tensor,
+    store: Dict[int, List[float]],
+) -> None:
+    """Bucket per-example distillation losses by label, in place.
+
+    Args:
+        per_example_loss: Detached per-example divergence of shape (batch,).
+        labels: Integer label tensor of shape (batch,).
+        store: Accumulator mapping class id -> list of per-example losses.
+    """
+    losses = per_example_loss.detach().float().cpu()
+    for i, yy in enumerate(labels):
+        store[int(yy.item())].append(float(losses[i]))
+
+
+# ---------------------------------------------------------------------------
+# 3b. Reliability: how much does a client actually know about each class?
+# ---------------------------------------------------------------------------
+def compute_reliability(
+    per_class_correct: np.ndarray,
+    per_class_total: np.ndarray,
+    overall_accuracy: float,
+    prior_strength: float = 5.0,
+    num_classes: int = 6,
+) -> np.ndarray:
+    """Shrunk per-class accuracy for aggregation reliability weighting.
+
+    # Raw accuracy on small holdouts is noisy. Shrink each estimate toward overall
+    # accuracy using an empirical-Bayes pseudo-count.
+
+    # m=0: raw accuracy; large m: collapses to overall accuracy.
+
+    Args:
+        per_class_correct: Correct predictions per class on the local holdout.
+        per_class_total: Held-out examples per class.
+        overall_accuracy: The client's accuracy across all held-out examples.
+        prior_strength: Pseudo-count m. Larger = more shrinkage toward the overall rate.
+        num_classes: Size of the canonical label space.
+
+    Returns array in [0, 1]. Missing classes fall back to overall accuracy.
+    """
+    correct = np.asarray(per_class_correct, dtype=np.float64)[:num_classes]
+    total = np.asarray(per_class_total, dtype=np.float64)[:num_classes]
+    m = max(float(prior_strength), 0.0)
+    prior = float(np.clip(overall_accuracy, 0.0, 1.0))
+
+    numer = correct + m * prior
+    denom = total + m
+    # Classes with no held-out examples and m == 0 would divide by zero; fall back to prior.
+    out = np.where(denom > 0, numer / np.clip(denom, 1e-12, None), prior)
+    return np.clip(out, 0.0, 1.0).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +367,8 @@ __all__ = [
     "collect_class_logits",
     "average_class_logits",
     "aggregate_class_logits",
+    "accumulate_class_losses",
+    "compute_reliability",
     "build_logit_targets",
     "distillation_loss",
     "logits_to_serializable",

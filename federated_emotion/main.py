@@ -517,10 +517,27 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     if config.fd_weight_by_count
                     else None
                 )
+                # Reliability = shrunk per-class accuracy on each client's own holdout.
+                # Measures competence against ground truth, not consensus.
+                per_client_reliability = (
+                    [r.get("reliability") for r in client_results]
+                    if config.fd_use_reliability
+                    else None
+                )
+                per_client_losses = (
+                    [r.get("class_losses") for r in client_results]
+                    if config.fd_use_loss_term
+                    else None
+                )
                 global_class_logits = aggregate_class_logits(
                     per_client_logits,
                     class_counts=per_client_counts,
+                    reliability=per_client_reliability,
+                    class_losses=per_client_losses,
+                    count_exponent=config.fd_count_exponent,
+                    reliability_exponent=config.fd_reliability_exponent,
                     num_classes=config.num_classes,
+                    client_ids=[int(r["client_id"]) for r in client_results],
                 )
 
                 if global_class_logits is not None:
