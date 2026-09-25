@@ -867,8 +867,10 @@ def _load_benchmark_frames(config: Config) -> Dict[str, Any]:
     build_text = spec["text"]
 
     # None (or <= 0) means use the entire split.
-    train_n = getattr(config, "train_subset_size", None) or config.dbpedia_train_samples
-    test_n = getattr(config, "test_subset_size", None) or config.dbpedia_test_size
+    train_n, test_n = config.train_subset_size, config.test_subset_size
+    if config.dataset_mode == "dbpedia":
+        train_n = train_n or config.dbpedia_train_samples
+        test_n = test_n or config.dbpedia_test_size
 
     def _prep(split, n: Optional[int], seed: int) -> Dataset:
         split = split.shuffle(seed=seed)
