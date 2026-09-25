@@ -108,6 +108,14 @@ class Config:
     def is_dbpedia(self) -> bool:
         return self.dataset_mode == "dbpedia"
 
+    @property
+    def is_ag_news(self) -> bool:
+        return self.dataset_mode == "ag_news"
+
+    @property
+    def is_text_benchmark(self) -> bool:
+        return self.dataset_mode in ("dbpedia", "ag_news")
+
     mode: str = "public_set"
 
     # --- data_free_fd parameters (ignored when mode == "public_set") -------
@@ -124,6 +132,19 @@ class Config:
     #: dataset. In data_free_fd mode this is the ONLY evaluation set a client has, so the old
     #: hard-coded 50 (~8 examples per class over 6 classes) was far too small to read.
     local_holdout_size: int = 200
+
+    # --- DBpedia (SEMFED-style) protocol; used only when dataset_mode == "dbpedia" -------
+    #: Dirichlet concentration for the label-skew client split. None = IID.
+    dirichlet_alpha: Optional[float] = None
+    #: Total training examples drawn from DBpedia-14 and split across all clients.
+    dbpedia_train_samples: int = 10000
+    #: Size of the shared global test subset every client is scored on each round.
+    dbpedia_test_size: int = 5000
+    #: Generic train/test subset sizes for any benchmark dataset. None = use the full split.
+    train_subset_size: Optional[int] = None
+    test_subset_size: Optional[int] = None
+    #: Optional {client_id: hf_model_id} roster overriding the built-in registry.
+    client_models: Optional[Dict[int, str]] = None
 
     @property
     def is_public_set(self) -> bool:
@@ -188,6 +209,14 @@ class Config:
             sparse_training_cfg = SparseTrainingConfig()
 
         # Field-type casting for safety (e.g. exponential notation strings or int-float mismatches)
+        client_models_raw = data.get("client_models")
+        client_models = (
+            {int(k): str(v) for k, v in client_models_raw.items()}
+            if isinstance(client_models_raw, dict)
+            else None
+        )
+        alpha_raw = data.get("dirichlet_alpha")
+
         return cls(
             num_clients=int(data["num_clients"]),
             num_rounds=int(data["num_rounds"]),
@@ -222,6 +251,12 @@ class Config:
             fd_temperature=float(data.get("fd_temperature", 2.0)),
             fd_weight_by_count=bool(data.get("fd_weight_by_count", True)),
             local_holdout_size=int(data.get("local_holdout_size", 200)),
+            dirichlet_alpha=None if alpha_raw is None else float(alpha_raw),
+            dbpedia_train_samples=int(data.get("dbpedia_train_samples", 10000)),
+            dbpedia_test_size=int(data.get("dbpedia_test_size", 5000)),
+            train_subset_size=(None if data.get("train_subset_size") is None else int(data["train_subset_size"])),
+            test_subset_size=(None if data.get("test_subset_size") is None else int(data["test_subset_size"])),
+            client_models=client_models,
         )
 
     @classmethod

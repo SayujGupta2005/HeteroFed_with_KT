@@ -31,7 +31,6 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 from transformers import (
-    AutoModelForSequenceClassification,
     AutoConfig,
     AutoModel,
     AutoTokenizer,
@@ -62,6 +61,11 @@ logger = logging.getLogger(__name__)
 # Under mode="data_free_fd" only [num_classes] logit vectors are exchanged, so differing hidden
 # sizes and depths across families cost nothing -- no feature_dim alignment or projection needed.
 
+# Encoder rosters used when dataset_mode == "dbpedia" (full fine-tuning, no LoRA/quantization).
+# Overridable per-run via ``client_models`` in the YAML.
+#
+# DBPEDIA_BERT_MODELS is the default five-client roster (five encoder families, same size).
+# config_semfed.yaml overrides it with a 10-client small/medium/large roster.
 DBPEDIA_BERT_MODELS = [
     "bert-base-uncased",
     "roberta-base",
@@ -69,6 +73,24 @@ DBPEDIA_BERT_MODELS = [
     "albert-base-v2",
     "google/electra-base-discriminator"
 ]
+
+#: Set by main.run_pipeline from Config.client_models; takes precedence over every registry.
+_REGISTRY_OVERRIDE: Optional[Dict[int, str]] = None
+
+
+def set_client_registry(config: Config) -> None:
+    """Install the roster from ``config.client_models`` (or the DBpedia default)."""
+    global _REGISTRY_OVERRIDE
+    if getattr(config, "client_models", None):
+        _REGISTRY_OVERRIDE = dict(config.client_models)
+    elif getattr(config, "is_text_benchmark", False):
+        # Cycle the BERT roster across all clients (each model reused as needed).
+        _REGISTRY_OVERRIDE = {
+            i + 1: DBPEDIA_BERT_MODELS[i % len(DBPEDIA_BERT_MODELS)]
+            for i in range(config.num_clients)
+        }
+    else:
+        _REGISTRY_OVERRIDE = None
 
 CLIENT_MODELS: Dict[int, str] = {
     1: "microsoft/Phi-3.5-mini-instruct",              # Phi-3     3.8B  hidden 3072
@@ -88,9 +110,11 @@ DEFAULT_FALLBACK_MODEL: str = "Qwen/Qwen2.5-3B"       # Default for client IDs b
 
 
 def get_model_for_client(client_id: int, config: Config = None) -> str:
-    if config and getattr(config, 'is_dbpedia', False):
-        return DBPEDIA_BERT_MODELS[client_id % len(DBPEDIA_BERT_MODELS)]
     """Return model identifier for client_id (1-indexed or 0-indexed), with default fallback."""
+    if _REGISTRY_OVERRIDE is not None:
+        if client_id in _REGISTRY_OVERRIDE:
+            return _REGISTRY_OVERRIDE[client_id]
+        raise KeyError(f"client_id {client_id} missing from the configured client_models roster.")
     if client_id in CLIENT_MODELS:
         return CLIENT_MODELS[client_id]
     if (client_id + 1) in CLIENT_MODELS:
@@ -214,14 +238,24 @@ class FederatedClassifier(nn.Module):
         super().__init__()
         self.model_id = model_id
 
-        if getattr(config, 'is_dbpedia', False):
-            self.backbone = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=num_labels, ignore_mismatched_sizes=True)
-            self.hidden_size = self.backbone.config.hidden_size if hasattr(self.backbone.config, "hidden_size") else 768
-            self.head = None # Handled by backbone
-            return
-    
         self.num_labels = num_labels
         self.config = config
+        self.full_finetune = False
+
+        if getattr(config, 'is_text_benchmark', False):
+            # Small encoders are fully fine-tuned in fp32: no LoRA, no quantization.
+            self.full_finetune = True
+            self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self.backbone = AutoModel.from_pretrained(
+                model_id, token=config.hf_token if config else None
+            ).to(self._device)
+            self.hidden_size = _extract_hidden_size(self.backbone.config)
+            self.head = nn.Linear(self.hidden_size, num_labels, device=self._device)
+            print(
+                f"  Model '{model_id}': full fine-tune, "
+                f"{sum(p.numel() for p in self.backbone.parameters()) / 1e6:.1f}M params"
+            )
+            return
 
         token = config.hf_token if config else None
         effective_rank = (
@@ -458,6 +492,11 @@ def save_adapter(
     save_dir = Path(path)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    if getattr(model, "full_finetune", False):
+        torch.save(model.backbone.state_dict(), save_dir / "backbone.pt")
+        torch.save(model.head.state_dict(), save_dir / "head.pt")
+        return
+
     # 1. Save PEFT LoRA adapter weights and config
     if hasattr(model, "backbone") and isinstance(model.backbone, PeftModel):
         model.backbone.save_pretrained(str(save_dir))
@@ -483,6 +522,15 @@ def load_adapter(
     load_dir = Path(path)
     if not load_dir.exists():
         raise FileNotFoundError(f"Adapter checkpoint directory does not exist: {load_dir}")
+
+    if getattr(model, "full_finetune", False):
+        model.backbone.load_state_dict(
+            torch.load(load_dir / "backbone.pt", map_location=self_or_cpu_device(model), weights_only=True)
+        )
+        model.head.load_state_dict(
+            torch.load(load_dir / "head.pt", map_location=self_or_cpu_device(model), weights_only=True)
+        )
+        return
 
     # 1. Load LoRA adapter
     if hasattr(model, "backbone") and isinstance(model.backbone, PeftModel):
@@ -611,6 +659,7 @@ __all__ = [
     "CLIENT_MODELS",
     "FederatedClassifier",
     "get_model_for_client",
+    "set_client_registry",
     "get_tokenizer",
     "save_adapter",
     "load_adapter",

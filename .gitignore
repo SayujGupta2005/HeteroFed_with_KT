@@ -80,8 +80,12 @@ Desktop.ini
 # Federated Learning Checkpoints, Models, Logs, and Results
 checkpoints/
 checkpoints_smoke/
+checkpoints_agnews_smoke/
+checkpoints_semfed/
 logs/
 logs_smoke/
+logs_agnews_smoke/
+logs_semfed/
 results/
 *.pt
 *.pth

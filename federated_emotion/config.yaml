@@ -15,25 +15,23 @@
 
 # mode: "public_set"
 mode: "data_free_fd"
-dataset_mode: "dbpedia"
+dataset_mode: "ag_news"
+num_classes: 4
 
 # ---------------------------------------------------------------------------
 # clients
 # ---------------------------------------------------------------------------
-# Five 3-4B backbones across three architecture families, one loaded at a time.
-#   1 Phi-3.5-mini-instruct    <- go_emotions (simplified)
-#   2 Qwen2.5-3B-Instruct      <- tweet_eval (emotion)
-#   3 Phi-3-mini-4k-instruct   <- sem_eval_2018_task1 (subtask5.english)
-#   4 Qwen2.5-3B               <- xed_en_fi (en_annotated)
-#   5 Qwen1.5-4B-Chat          <- emotion (dair-ai)
-#
-# Clients 4 and 5 replace the old silicone entries, whose HF loaders no longer work; they
-# previously "loaded" only because DATASET_ALIASES redirected them to mteb/emotion, i.e. the
-# evaluation corpus. dair-ai/emotion is legitimate as a client dataset here because
-# data_free_fd loads no public pool -- and it is the only source carrying all six canonical
-# labels, which lifts 'love' from one usable holder to two.
-num_clients: 5
-active_client_ids: [1, 2, 3, 4, 5]
+# 10 clients over the 5 BERT-family encoders (bert-base, roberta-base, distilbert-base,
+# albert-base-v2, electra-base), cycled so each model is used by two clients.
+num_clients: 10
+active_client_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+# ---------------------------------------------------------------------------
+# data protocol (AG News: 4 classes, columns text/label)
+# ---------------------------------------------------------------------------
+dirichlet_alpha: 0.1              # label-skew non-IID split; null = IID
+train_subset_size: null          # null = full 120,000 train examples
+test_subset_size: null           # null = full 7,600 test examples (shared global test set)
 
 num_rounds: 5
 local_epochs: 3

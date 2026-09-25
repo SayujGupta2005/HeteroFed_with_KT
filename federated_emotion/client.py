@@ -17,6 +17,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset
+from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
 try:
@@ -112,6 +114,7 @@ def run_client_round(
     cross_eval_datasets: Optional[Dict[str, Dataset]] = None,
     local_eval_holdout: Optional[Dataset] = None,
     global_class_logits: Optional[Dict[int, np.ndarray]] = None,
+    global_test_dataset: Optional[Dataset] = None,
 ) -> Optional[Dict[str, Any]]:
     """Execute a single local training and distillation round for an active client.
 
@@ -136,6 +139,8 @@ def run_client_round(
         local_eval_holdout: This client's own held-out slice. Used for eval_accuracy in
             data-free mode, where no public holdout exists.
         global_class_logits: Server-aggregated per-class logit vectors (data_free_fd mode only).
+        global_test_dataset: Shared test set (DBpedia mode). Scored every round for accuracy and
+            macro-F1, so runs can be compared against a paper's single D_test number.
 
     Returns:
         Dictionary containing client metrics, eval accuracy, cross-dataset matrix entries, and
@@ -155,6 +160,8 @@ def run_client_round(
         reg_id = client_id if client_id in CLIENT_DATASETS else client_id + 1
         dataset_info = CLIENT_DATASETS.get(reg_id, ("Custom / Private", None))
         dataset_name = f"{dataset_info[0]}" + (f" ({dataset_info[1]})" if dataset_info[1] else "")
+        if config.is_text_benchmark:
+            dataset_name = f"{config.dataset_mode} shard"
 
         print("\n" + "=" * 80)
         print(
@@ -176,7 +183,7 @@ def run_client_round(
         tokenizer = get_tokenizer(model_id, config=config)
 
         # 3. Model initialization & checkpoint restoration
-        model = FederatedClassifier(model_id=model_id, num_labels=NUM_CLASSES, config=config)
+        model = FederatedClassifier(model_id=model_id, num_labels=config.num_classes, config=config)
 
         if round_num > 1:
             # Check for prior round checkpoint
@@ -479,12 +486,46 @@ def run_client_round(
                     cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
             global_profiler.stop("Client_Cross_Eval")
 
+        # 9b. Global test-set accuracy and macro-F1 (DBpedia mode)
+        test_accuracy: Optional[float] = None
+        test_macro_f1: Optional[float] = None
+        if global_test_dataset is not None and len(global_test_dataset) > 0:
+            global_profiler.start("Client_Global_Test")
+            test_loader = DataLoader(
+                global_test_dataset,
+                batch_size=config.batch_size_infer,
+                shuffle=False,
+                collate_fn=eval_collate,
+            )
+            all_preds: List[int] = []
+            all_true: List[int] = []
+            with torch.no_grad():
+                for t_batch in test_loader:
+                    t_out = model(
+                        input_ids=t_batch["input_ids"].to(device),
+                        attention_mask=t_batch["attention_mask"].to(device),
+                    )
+                    all_preds.extend(torch.argmax(t_out, dim=-1).cpu().tolist())
+                    all_true.extend(t_batch["label"].tolist())
+            test_accuracy = float(accuracy_score(all_true, all_preds))
+            test_macro_f1 = float(
+                f1_score(all_true, all_preds, average="macro", labels=list(range(config.num_classes)), zero_division=0)
+            )
+            print(
+                f"  [Client {client_id:02d}] Global test: acc {test_accuracy * 100:.2f}% | "
+                f"macro-F1 {test_macro_f1:.4f} ({len(all_true)} examples)"
+            )
+            global_profiler.stop("Client_Global_Test")
+
         # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (
             Path(config.checkpoint_dir) / f"client_{client_id}" / f"round_{round_num}"
         )
         save_adapter(model, checkpoint_path)
         print(f"  -> Checkpoint saved to: {checkpoint_path}")
+        if getattr(model, "full_finetune", False) and round_num > 2:
+            # Full-weight checkpoints are 45-260 MB each; only the previous round is ever read.
+            shutil.rmtree(checkpoint_path.parent / f"round_{round_num - 2}" , ignore_errors=True)
 
         # 11. Free Model VRAM
         free_model(model)
@@ -494,6 +535,9 @@ def run_client_round(
             "client_id": client_id,
             "mode": config.mode,
             "eval_accuracy": eval_accuracy,
+            "test_accuracy": test_accuracy,
+            "test_macro_f1": test_macro_f1,
+            "predictions": all_preds if test_accuracy is not None else None,
             "cross_eval_accuracies": cross_eval_accuracies,
             # --- public_set payload (None in data-free mode) ---
             "logits_on_kd_pool": logits_on_kd_pool,

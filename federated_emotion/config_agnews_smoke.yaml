@@ -1,0 +1,48 @@
+# config_agnews_smoke.yaml -- tiny end-to-end check of the AG News pipeline.
+# Same setup as config.yaml but a small subsample and 2 rounds.
+
+mode: "data_free_fd"
+dataset_mode: "ag_news"
+num_classes: 4
+
+num_clients: 10
+active_client_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+dirichlet_alpha: 0.1
+train_subset_size: 800
+test_subset_size: 200
+
+num_rounds: 2
+local_epochs: 1
+batch_size_train: 8
+batch_size_infer: 16
+max_seq_length: 128
+learning_rate: 2e-4
+
+quant_bits: 16
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+optimizer_8bit: false
+sparse_training:
+  enabled: false
+  reduced_rank: 2
+
+fd_lambda: 1.0
+fd_temperature: 2.0
+fd_weight_by_count: true
+kd_warmup_rounds: 1
+local_holdout_size: 40
+private_dataset_max_size: 2000
+
+kd_lambda: 0.5
+kd_temperature: 2.0
+aggregation_mode: "accuracy_weighted"
+aggregation_temperature: 1.0
+public_kd_pool_size: 500
+public_eval_holdout_size: 200
+
+seed_base: 42
+checkpoint_dir: "./checkpoints_agnews_smoke"
+log_dir: "./logs_agnews_smoke"
+hf_token_env_var: "HF_TOKEN"

@@ -40,7 +40,8 @@ from federated_emotion.client import run_client_round
 from federated_emotion.config import Config, load_config
 from federated_emotion.profiler import global_profiler
 from federated_emotion.data.loaders import (
-    CANONICAL_LABELS,
+    get_class_names,
+    load_benchmark_test_set,
     CLIENT_DATASETS,
     compute_class_counts,
     load_private_dataset,
@@ -59,6 +60,7 @@ from federated_emotion.eval_utils import (
 from federated_emotion.models.wrapper import (
     CLIENT_MODELS,
     get_model_for_client,
+    set_client_registry,
     preload_client_models,
 )
 from federated_emotion.server import aggregate
@@ -210,8 +212,56 @@ def _cache_client_result(
 # ---------------------------------------------------------------------------
 # 3. Main Pipeline Orchestrator
 # ---------------------------------------------------------------------------
+def _report_paper_metrics(
+    round_num: int,
+    client_results: List[Dict[str, Any]],
+    config: Config,
+    results_dir: Path,
+    log_path: Path,
+) -> None:
+    """Print and append the metrics a SEMFED-style table reports: accuracy, macro-F1,
+    client agreement, and cumulative communication."""
+    scored = [r for r in client_results if r.get("test_accuracy") is not None]
+    if not scored:
+        return
+
+    preds = [np.asarray(r["predictions"]) for r in scored if r.get("predictions") is not None]
+    agreement = None
+    if len(preds) > 1:
+        pair = [
+            float(np.mean(preds[i] == preds[j]))
+            for i in range(len(preds))
+            for j in range(i + 1, len(preds))
+        ]
+        agreement = float(np.mean(pair))
+
+    # FD uplink: one [num_classes]-vector per held class per client; downlink: the aggregate.
+    per_client_up = config.num_classes * config.num_classes * 4
+    up_bytes = per_client_up * len(client_results)
+    down_bytes = per_client_up * len(client_results)
+
+    record = {
+        "round": round_num,
+        "mean_test_accuracy": float(np.mean([r["test_accuracy"] for r in scored])),
+        "mean_test_macro_f1": float(np.mean([r["test_macro_f1"] for r in scored])),
+        "per_client_test_accuracy": {int(r["client_id"]): r["test_accuracy"] for r in scored},
+        "client_agreement": agreement,
+        "round_comm_bytes_fd": up_bytes + down_bytes,
+    }
+    print(
+        f"  [SEMFED-style] round {round_num}: acc {record['mean_test_accuracy'] * 100:.2f}% | "
+        f"macro-F1 {record['mean_test_macro_f1']:.4f} | "
+        f"agreement {'n/a' if agreement is None else f'{agreement:.3f}'} | "
+        f"comm {record['round_comm_bytes_fd']} B"
+    )
+    for target_dir in [log_path, results_dir]:
+        with open(target_dir / "paper_metrics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+
 def run_pipeline(config: Config, resume: bool = False) -> None:
     """Execute the end-to-end federated distillation training and aggregation loop."""
+    set_client_registry(config)
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = Path("./results") / f"run_{run_timestamp}"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -275,6 +325,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     cross_eval_datasets: Dict[str, Any] = {}
     active_clients: List[int] = []
 
+    class_names = get_class_names(config)
+    global_test_dataset = load_benchmark_test_set(config) if config.is_text_benchmark else None
+
     # Map across targeted client IDs (active_client_ids if present, else 1..num_clients)
     target_client_ids = (
         config.active_client_ids
@@ -293,6 +346,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
             m_short = m_id.split("/")[-1]
             ds_info = CLIENT_DATASETS.get(client_id, ("Custom", None))
             ds_name = ds_info[0] + (f" ({ds_info[1]})" if ds_info[1] else "")
+            if config.is_text_benchmark:
+                ds_name = f"{config.dataset_mode} shard"
 
             # Carve this client's own held-out slice. In data-free mode this is the *only*
             # evaluation set the client has, so it needs enough examples to be readable --
@@ -331,7 +386,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
     # Report class coverage: both modes aggregate per class, so absent or thin classes matter.
     print("\n  Class coverage of the active roster (train slices):")
-    header = "    " + f"{'client':<8}" + "".join(f"{c:>10}" for c in CANONICAL_LABELS[:config.num_classes])
+    header = "    " + f"{'client':<8}" + "".join(f"{c[:9]:>10}" for c in class_names)
     print(header)
     for cid in active_clients:
         counts = client_class_counts[cid]
@@ -340,7 +395,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
     print("    " + f"{'TOTAL':<8}" + "".join(f"{int(n):>10}" for n in totals))
     holders = np.sum([client_class_counts[c] > 0 for c in active_clients], axis=0)
     print("    " + f"{'holders':<8}" + "".join(f"{int(n):>10}" for n in holders))
-    for j, name in enumerate(CANONICAL_LABELS[:config.num_classes]):
+    for j, name in enumerate(class_names):
         if holders[j] == 0:
             print(f"    [FATAL] class '{name}' is absent from every client; it cannot be learned.")
         elif holders[j] == 1:
@@ -491,6 +546,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                     cross_eval_datasets=current_cross_eval,
                     local_eval_holdout=local_eval_holdouts[client_id],
                     global_class_logits=global_class_logits,
+                    global_test_dataset=global_test_dataset,
                 )
 
                 if result is not None:
@@ -576,6 +632,9 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                             "num_eval_holdout": int(r.get("num_eval_holdout", 0)),
                         }
                         f_jsonl.write(json.dumps(record) + "\n")
+
+            if global_test_dataset is not None:
+                _report_paper_metrics(round_num, client_results, config, results_dir, log_path)
 
             metric_tracker.log_round(
                 round_num=round_num,

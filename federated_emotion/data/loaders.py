@@ -571,15 +571,8 @@ def load_private_dataset(
     client_id: int,
     config: Config,
 ) -> Optional[Dataset]:
-    global DBPEDIA_PARTITIONS
-    if getattr(config, "is_dbpedia", False):
-        print(f"[Client {client_id}] Routing to unified DBpedia Kaggle pipeline...")
-        if not DBPEDIA_PARTITIONS:
-             full_df = download_and_load_dbpedia_kaggle()
-             DBPEDIA_PARTITIONS = get_iid_partitions(full_df, config.num_clients)
-        if client_id >= len(DBPEDIA_PARTITIONS):
-             client_id = client_id % len(DBPEDIA_PARTITIONS)
-        return DBPEDIA_PARTITIONS[client_id]
+    if getattr(config, "is_text_benchmark", False):
+        return load_benchmark_client_shard(client_id, config)
 
     # Legacy logic
     """Load, harmonize, filter, and cap a private dataset for a federated client.
@@ -784,43 +777,151 @@ __all__ = [
     "load_public_dataset",
     "load_private_dataset",
     "compute_class_counts",
+    "get_class_names",
+    "load_benchmark_client_shard",
+    "load_benchmark_test_set",
+    "load_dbpedia_test_set",
 ]
 
 
-def download_and_load_dbpedia_kaggle(download_dir: str = "./data/dbpedia") -> pd.DataFrame:
-    os.makedirs(download_dir, exist_ok=True)
-    print("Downloading DBpedia dataset from Kaggle...")
-    dataset_identifier = "danofer/dbpedia-classes" 
-    
-    try:
-        kaggle.api.authenticate()
-        kaggle.api.dataset_download_files(dataset_identifier, path=download_dir, unzip=True)
-    except Exception as e:
-        print(f"Failed to download from Kaggle: {e}. Ensure ~/.kaggle/kaggle.json exists.")
-        # Mock dataframe for testing if api fails
-        return pd.DataFrame({"text": ["mock text"]*100, "class": [0]*100})
-        
-    csv_files = [f for f in os.listdir(download_dir) if f.endswith('.csv')]
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV file found in {download_dir}")
-        
-    csv_path = os.path.join(download_dir, csv_files[0])
-    df = pd.read_csv(csv_path)
-    if "class" in df.columns and "content" in df.columns:
-        df["text"] = df["content"]
-        df["label"] = df["class"] - 1 # 1-indexed to 0-indexed typically
-    return df
+# ---------------------------------------------------------------------------
+# 9. Benchmark text-classification datasets (DBpedia-14, AG News)
+# ---------------------------------------------------------------------------
+DBPEDIA_LABELS: List[str] = [
+    "Company", "EducationalInstitution", "Artist", "Athlete", "OfficeHolder",
+    "MeanOfTransportation", "Building", "NaturalPlace", "Village", "Animal",
+    "Plant", "Album", "Film", "WrittenWork",
+]
+AG_NEWS_LABELS: List[str] = ["World", "Sports", "Business", "Sci/Tech"]
 
-def get_iid_partitions(df: pd.DataFrame, num_clients: int) -> list:
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    partitions = []
-    chunk_size = math.ceil(len(df) / num_clients)
-    
-    for i in range(num_clients):
-        chunk_df = df.iloc[i * chunk_size : (i + 1) * chunk_size]
-        if "label" not in chunk_df.columns:
-             chunk_df["label"] = 0
-        dataset = Dataset.from_pandas(chunk_df)
-        partitions.append(dataset)
-        
-    return partitions
+# Each entry: candidate Hub paths, class names, and how to build the text field.
+BENCHMARK_DATASETS: Dict[str, Dict[str, Any]] = {
+    "dbpedia": {
+        "hf_ids": ["fancyzhx/dbpedia_14"],
+        "labels": DBPEDIA_LABELS,
+        "text": lambda ex: f"{ex['title']}. {ex['content']}".strip(),
+    },
+    "ag_news": {
+        "hf_ids": ["fancyzhx/ag_news", "ag_news"],
+        "labels": AG_NEWS_LABELS,
+        "text": lambda ex: ex["text"],
+    },
+}
+
+_BENCHMARK_CACHE: Dict[str, Any] = {}
+
+
+def get_class_names(config: Config) -> List[str]:
+    """Human-readable class names for the active dataset mode."""
+    spec = BENCHMARK_DATASETS.get(getattr(config, "dataset_mode", ""))
+    if spec is not None:
+        return spec["labels"][: config.num_classes]
+    return CANONICAL_LABELS[: config.num_classes]
+
+
+def dirichlet_partition(
+    labels: np.ndarray,
+    num_clients: int,
+    alpha: float,
+    seed: int,
+    min_size: int = 20,
+) -> List[np.ndarray]:
+    """Label-skew non-IID split (Hsu et al. 2019): per class, share ~ Dirichlet(alpha).
+
+    Retries until every client holds at least ``min_size`` examples. Smaller alpha means more skew.
+    """
+    rng = np.random.default_rng(seed)
+    classes = np.unique(labels)
+    for _ in range(1000):
+        shards: List[List[int]] = [[] for _ in range(num_clients)]
+        for c in classes:
+            idx = np.where(labels == c)[0]
+            rng.shuffle(idx)
+            props = rng.dirichlet(np.full(num_clients, alpha))
+            cuts = (np.cumsum(props) * len(idx)).astype(int)[:-1]
+            for k, part in enumerate(np.split(idx, cuts)):
+                shards[k].extend(part.tolist())
+        if min(len(s) for s in shards) >= min_size:
+            return [np.array(rng.permutation(s)) for s in shards]
+    raise RuntimeError(
+        f"Could not build a Dirichlet(alpha={alpha}) split with >= {min_size} examples per client."
+    )
+
+
+def _load_benchmark_frames(config: Config) -> Dict[str, Any]:
+    """Load the active benchmark dataset once: train subset, client shards, and a test subset."""
+    if _BENCHMARK_CACHE:
+        return _BENCHMARK_CACHE
+
+    spec = BENCHMARK_DATASETS[config.dataset_mode]
+    raw = None
+    last_error: Optional[Exception] = None
+    for hf_id in spec["hf_ids"]:
+        try:
+            raw = load_dataset(hf_id, token=config.hf_token)
+            break
+        except Exception as e:
+            last_error = e
+    if raw is None:
+        raise RuntimeError(f"Could not load '{config.dataset_mode}' from {spec['hf_ids']}: {last_error}")
+    build_text = spec["text"]
+
+    # None (or <= 0) means use the entire split.
+    train_n = getattr(config, "train_subset_size", None) or config.dbpedia_train_samples
+    test_n = getattr(config, "test_subset_size", None) or config.dbpedia_test_size
+
+    def _prep(split, n: Optional[int], seed: int) -> Dataset:
+        split = split.shuffle(seed=seed)
+        if n and n > 0:
+            split = split.select(range(min(n, len(split))))
+        return split.map(
+            lambda ex: {"text": build_text(ex), "label": int(ex["label"])},
+            remove_columns=split.column_names,
+        )
+
+    train = _prep(raw["train"], train_n, config.seed_base)
+    test = _prep(raw["test"], test_n, config.seed_base + 1)
+
+    labels = np.asarray(train["label"], dtype=np.int64)
+    if config.dirichlet_alpha is None:
+        rng = np.random.default_rng(config.seed_base)
+        perm = rng.permutation(len(train))
+        index_shards = [np.array(a) for a in np.array_split(perm, config.num_clients)]
+        split_name = "IID"
+    else:
+        index_shards = dirichlet_partition(
+            labels, config.num_clients, config.dirichlet_alpha, config.seed_base
+        )
+        split_name = f"Dirichlet(alpha={config.dirichlet_alpha})"
+
+    shards = [train.select(s.tolist()) for s in index_shards]
+    _BENCHMARK_CACHE.update({"shards": shards, "test": test, "split": split_name})
+    print(
+        f"[{config.dataset_mode}] {len(train)} train / {len(test)} test examples, "
+        f"{config.num_clients} clients, {split_name} split."
+    )
+
+    # Per-client class distribution, so the label skew is verifiable at load time.
+    names = spec["labels"][: config.num_classes]
+    print("    " + f"{'client':<8}" + "".join(f"{c[:9]:>10}" for c in names))
+    for cid, shard in enumerate(shards, 1):
+        counts = compute_class_counts(shard, config.num_classes)
+        print("    " + f"{cid:<8}" + "".join(f"{int(n):>10}" for n in counts))
+    return _BENCHMARK_CACHE
+
+
+def load_benchmark_client_shard(client_id: int, config: Config) -> Dataset:
+    """Return client ``client_id`` (1-indexed) private shard of the active benchmark dataset."""
+    shards = _load_benchmark_frames(config)["shards"]
+    if not 1 <= client_id <= len(shards):
+        raise ValueError(f"client_id {client_id} outside 1..{len(shards)} for benchmark shards.")
+    return shards[client_id - 1]
+
+
+def load_benchmark_test_set(config: Config) -> Dataset:
+    """Shared global test subset (from the benchmark dataset's official test split)."""
+    return _load_benchmark_frames(config)["test"]
+
+
+# Back-compat alias.
+load_dbpedia_test_set = load_benchmark_test_set
