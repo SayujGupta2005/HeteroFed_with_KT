@@ -418,11 +418,18 @@ def run_client_round(
             global_profiler.stop("Client_KD_Inference")
 
         # 8. Client Evaluation
-        # public_set   -> the shared public holdout
-        # data_free_fd -> this client's own held-out slice, so no public corpus is involved
+        # When global_test_dataset is provided (e.g. text benchmarks with all classes),
+        # all clients evaluate on that identical test set containing all classes.
         global_profiler.start("Client_Local_Eval")
-        eval_dataset = local_eval_holdout if is_data_free else public_eval_holdout
-        eval_source = "own local holdout" if is_data_free else "public eval holdout"
+        if global_test_dataset is not None and len(global_test_dataset) > 0:
+            eval_dataset = global_test_dataset
+            eval_source = "shared global test set"
+        elif is_data_free:
+            eval_dataset = local_eval_holdout
+            eval_source = "own local holdout"
+        else:
+            eval_dataset = public_eval_holdout
+            eval_source = "public eval holdout"
 
         if eval_dataset is None or len(eval_dataset) == 0:
             raise ValueError(
@@ -441,6 +448,8 @@ def run_client_round(
 
         total_correct = 0
         total_eval_samples = 0
+        all_eval_preds: List[int] = []
+        all_eval_true: List[int] = []
         with torch.no_grad():
             for batch_eval in eval_loader:
                 input_ids = batch_eval["input_ids"].to(device)
@@ -451,11 +460,16 @@ def run_client_round(
                 preds = torch.argmax(logits, dim=-1)
                 total_correct += (preds == labels).sum().item()
                 total_eval_samples += labels.size(0)
+                all_eval_preds.extend(preds.cpu().tolist())
+                all_eval_true.extend(labels.cpu().tolist())
 
         eval_accuracy = float(total_correct / max(total_eval_samples, 1))
+        eval_macro_f1 = float(
+            f1_score(all_eval_true, all_eval_preds, average="macro", labels=list(range(config.num_classes)), zero_division=0)
+        )
         print(
-            f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% "
-            f"({total_correct}/{total_eval_samples})"
+            f"  [Client {client_id:02d}] Final Eval Accuracy: {eval_accuracy * 100:.2f}% | "
+            f"macro-F1: {eval_macro_f1:.4f} ({total_correct}/{total_eval_samples})"
         )
         global_profiler.stop("Client_Local_Eval")
 
@@ -486,36 +500,43 @@ def run_client_round(
                     cross_eval_accuracies[ds_key] = float(c_corr / max(c_tot, 1))
             global_profiler.stop("Client_Cross_Eval")
 
-        # 9b. Global test-set accuracy and macro-F1 (DBpedia mode)
+        # 9b. Global test-set accuracy and macro-F1
         test_accuracy: Optional[float] = None
         test_macro_f1: Optional[float] = None
+        all_preds: Optional[List[int]] = None
         if global_test_dataset is not None and len(global_test_dataset) > 0:
-            global_profiler.start("Client_Global_Test")
-            test_loader = DataLoader(
-                global_test_dataset,
-                batch_size=config.batch_size_infer,
-                shuffle=False,
-                collate_fn=eval_collate,
-            )
-            all_preds: List[int] = []
-            all_true: List[int] = []
-            with torch.no_grad():
-                for t_batch in test_loader:
-                    t_out = model(
-                        input_ids=t_batch["input_ids"].to(device),
-                        attention_mask=t_batch["attention_mask"].to(device),
-                    )
-                    all_preds.extend(torch.argmax(t_out, dim=-1).cpu().tolist())
-                    all_true.extend(t_batch["label"].tolist())
-            test_accuracy = float(accuracy_score(all_true, all_preds))
-            test_macro_f1 = float(
-                f1_score(all_true, all_preds, average="macro", labels=list(range(config.num_classes)), zero_division=0)
-            )
-            print(
-                f"  [Client {client_id:02d}] Global test: acc {test_accuracy * 100:.2f}% | "
-                f"macro-F1 {test_macro_f1:.4f} ({len(all_true)} examples)"
-            )
-            global_profiler.stop("Client_Global_Test")
+            if eval_dataset is global_test_dataset:
+                test_accuracy = eval_accuracy
+                test_macro_f1 = eval_macro_f1
+                all_preds = all_eval_preds
+            else:
+                global_profiler.start("Client_Global_Test")
+                test_loader = DataLoader(
+                    global_test_dataset,
+                    batch_size=config.batch_size_infer,
+                    shuffle=False,
+                    collate_fn=eval_collate,
+                )
+                t_preds: List[int] = []
+                t_true: List[int] = []
+                with torch.no_grad():
+                    for t_batch in test_loader:
+                        t_out = model(
+                            input_ids=t_batch["input_ids"].to(device),
+                            attention_mask=t_batch["attention_mask"].to(device),
+                        )
+                        t_preds.extend(torch.argmax(t_out, dim=-1).cpu().tolist())
+                        t_true.extend(t_batch["label"].tolist())
+                test_accuracy = float(accuracy_score(t_true, t_preds))
+                test_macro_f1 = float(
+                    f1_score(t_true, t_preds, average="macro", labels=list(range(config.num_classes)), zero_division=0)
+                )
+                all_preds = t_preds
+                print(
+                    f"  [Client {client_id:02d}] Global test: acc {test_accuracy * 100:.2f}% | "
+                    f"macro-F1 {test_macro_f1:.4f} ({len(t_true)} examples)"
+                )
+                global_profiler.stop("Client_Global_Test")
 
         # 10. Save Checkpoint (Adapter + Head)
         checkpoint_path = (

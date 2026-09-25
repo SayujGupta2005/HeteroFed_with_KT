@@ -349,19 +349,22 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
             if config.is_text_benchmark:
                 ds_name = f"{config.dataset_mode} shard"
 
-            # Carve this client's own held-out slice. In data-free mode this is the *only*
-            # evaluation set the client has, so it needs enough examples to be readable --
-            # config.local_holdout_size, not the old hard-coded 50 (~8 per class).
-            holdout_len = min(
-                config.local_holdout_size,
-                max(5, int(len(raw_ds) * 0.1)),
-            )
-            if len(raw_ds) > holdout_len:
-                train_slice = raw_ds.select(range(len(raw_ds) - holdout_len))
-                eval_slice = raw_ds.select(range(len(raw_ds) - holdout_len, len(raw_ds)))
-            else:
+            # When a shared global test dataset exists (e.g. text benchmarks with all classes),
+            # all clients evaluate on that identical test set, preserving the full shard for training.
+            if global_test_dataset is not None and len(global_test_dataset) > 0:
                 train_slice = raw_ds
-                eval_slice = raw_ds
+                eval_slice = global_test_dataset
+            else:
+                holdout_len = min(
+                    config.local_holdout_size,
+                    max(5, int(len(raw_ds) * 0.1)),
+                )
+                if len(raw_ds) > holdout_len:
+                    train_slice = raw_ds.select(range(len(raw_ds) - holdout_len))
+                    eval_slice = raw_ds.select(range(len(raw_ds) - holdout_len, len(raw_ds)))
+                else:
+                    train_slice = raw_ds
+                    eval_slice = raw_ds
 
             private_train_datasets[client_id] = train_slice
             local_eval_holdouts[client_id] = eval_slice
@@ -451,7 +454,7 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
                 f"Aggregation            : per-class logits, "
                 f"{'count-weighted' if config.fd_weight_by_count else 'unweighted (reference FD)'}",
                 f"Public Transfer Set    : NONE (data-free)",
-                f"Client Eval Source     : own local holdout ({config.local_holdout_size} max per client)",
+                f"Client Eval Source     : {'shared global test set' if global_test_dataset is not None else f'own local holdout ({config.local_holdout_size} max per client)'}",
             ]
             if config.is_data_free
             else [
