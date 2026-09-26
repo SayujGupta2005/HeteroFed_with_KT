@@ -8,7 +8,7 @@ num_classes: 4
 num_clients: 10
 active_client_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-dirichlet_alpha: 1.0
+dirichlet_alpha: 0.5
 train_subset_size: 800
 test_subset_size: 200
 
@@ -17,7 +17,7 @@ local_epochs: 1
 batch_size_train: 8
 batch_size_infer: 16
 max_seq_length: 128
-learning_rate: 2e-4
+learning_rate: 2e-5
 
 quant_bits: 16
 lora_rank: 8

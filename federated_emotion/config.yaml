@@ -10,7 +10,7 @@
 #   data_free_fd  No shared corpus at all. Clients exchange one averaged logit vector per
 #                 class they hold (FedDistill, Jeong et al. 2018, arXiv:1811.11479), and are
 #                 scored on their own held-out slices. Uses fd_* settings.
-#                 Upload is num_classes^2 floats per client per round -- 144 bytes for 6
+#                 Upload is num_classes^2 floats per client per round -- 64 bytes for 4
 #                 classes. Only one forward pass per training step, versus two in public_set.
 
 # mode: "public_set"
@@ -29,7 +29,7 @@ active_client_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 # ---------------------------------------------------------------------------
 # data protocol (AG News: 4 classes, columns text/label)
 # ---------------------------------------------------------------------------
-dirichlet_alpha: 1.0              # moderate label-skew non-IID split (1.0 = moderate skew, every client has all classes; null = IID)
+dirichlet_alpha: 0.5              # label-skew non-IID split: 0.1 = extreme, 0.5 = moderate, null = IID
 train_subset_size: null          # null = full 120,000 train examples
 test_subset_size: null           # null = full 7,600 test examples (shared global test set)
 
@@ -38,7 +38,7 @@ local_epochs: 3
 batch_size_train: 8
 batch_size_infer: 16
 max_seq_length: 128
-learning_rate: 2e-4
+learning_rate: 2e-5              # full fine-tune of BERT-family encoders; 2e-4 collapses them
 
 # ---------------------------------------------------------------------------
 # model / adapter

@@ -372,7 +372,8 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
             active_clients.append(client_id)
 
             col_header = f"Dataset: {ds_name} [Client {client_id:02d}: {m_short}]"
-            cross_eval_datasets[col_header] = eval_slice
+            if eval_slice is not global_test_dataset:  # every column would be the same test set
+                cross_eval_datasets[col_header] = eval_slice
             client_manifest_entries.append(
                 f"Client {client_id:02d} | Model: {m_id:<42} | Dataset: {ds_name:<30} | Train: {len(train_slice):<5} | Eval Holdout: {len(eval_slice)}"
             )

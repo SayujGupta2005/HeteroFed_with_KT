@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from transformers import get_linear_schedule_with_warmup
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
@@ -237,7 +238,8 @@ def run_client_round(
         if not trainable_params:
             raise ValueError(f"No trainable parameters found in model for client {client_id}.")
 
-        use_8bit = getattr(config, "optimizer_8bit", True) and HAS_BNB
+        # 8-bit AdamW is unstable on full fine-tunes (embedding layers), so it is LoRA-only.
+        use_8bit = getattr(config, "optimizer_8bit", True) and HAS_BNB and not model.full_finetune
         if use_8bit:
             try:
                 optimizer = bnb.optim.AdamW8bit(trainable_params, lr=config.learning_rate)
@@ -249,6 +251,10 @@ def run_client_round(
         else:
             optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
             print("  -> Optimizer: Standard AdamW" + (" (bitsandbytes not found)" if not HAS_BNB else ""))
+
+        # Linear warmup (10%) then decay; without it full fine-tuning collapses to one class.
+        total_steps = len(train_loader) * config.local_epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * total_steps), total_steps)
 
         ce_loss_fn = nn.CrossEntropyLoss()
         kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
@@ -350,7 +356,9 @@ def run_client_round(
                     loss = loss + (config.kd_lambda * loss_kd)
 
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
+                scheduler.step()
 
                 total_ce_loss += loss_ce.item()
                 total_kd_loss += loss_kd.item() if is_kd_active else 0.0
