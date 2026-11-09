@@ -24,6 +24,14 @@ if str(_parent_dir) not in sys.path:
 if str(_pkg_dir) not in sys.path:
     sys.path.insert(0, str(_pkg_dir))
 
+
+import math
+import pandas as pd
+import kaggle
+from datasets import Dataset
+
+DBPEDIA_PARTITIONS = []
+
 import numpy as np
 from datasets import Dataset, concatenate_datasets, load_dataset
 
