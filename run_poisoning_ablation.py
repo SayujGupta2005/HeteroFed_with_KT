@@ -154,6 +154,7 @@ def build_ablation_config(
     """
     cfg = copy.copy(base_config)
     cfg.mode = "data_free_fd"
+    cfg.dataset_mode = "legacy"
     cfg.num_clients = NUM_TOTAL_CLIENTS
     cfg.active_client_ids = list(range(1, NUM_TOTAL_CLIENTS + 1))
     cfg.num_rounds = ABLATION_ROUNDS

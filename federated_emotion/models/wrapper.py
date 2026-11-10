@@ -218,6 +218,10 @@ class FederatedClassifier(nn.Module):
             self.backbone = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=num_labels, ignore_mismatched_sizes=True)
             self.hidden_size = self.backbone.config.hidden_size if hasattr(self.backbone.config, "hidden_size") else 768
             self.head = None # Handled by backbone
+            try:
+                self._device = next(self.backbone.parameters()).device
+            except StopIteration:
+                self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             return
     
         self.num_labels = num_labels
@@ -385,7 +389,12 @@ class FederatedClassifier(nn.Module):
     @property
     def device(self) -> torch.device:
         """Return the device of the backbone parameters."""
-        return self._device
+        if hasattr(self, "_device"):
+            return self._device
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def forward(
         self,
