@@ -27,6 +27,22 @@ def _slice_linear(layer: nn.Linear, index: torch.Tensor, dim: int) -> nn.Linear:
     return new
 
 
+def prune_attention_heads(layer: nn.Module, keep_heads: Sequence[int]) -> None:
+    att = layer.attention
+    d = att.self.attention_head_size
+    device = att.self.query.weight.device
+    keep_list = sorted(list(keep_heads))
+    index = torch.cat([torch.arange(h * d, (h + 1) * d, device=device) for h in keep_list])
+
+    att.self.query = _slice_linear(att.self.query, index, dim=0)
+    att.self.key = _slice_linear(att.self.key, index, dim=0)
+    att.self.value = _slice_linear(att.self.value, index, dim=0)
+    att.output.dense = _slice_linear(att.output.dense, index, dim=1)
+
+    att.self.num_attention_heads = len(keep_list)
+    att.self.all_head_size = len(keep_list) * d
+
+
 class PrunableBert(nn.Module):
     def __init__(self, model_name: str = DEFAULT_BERT, num_labels: int = 6, pretrained: bool = True):
         super().__init__()
@@ -110,12 +126,11 @@ class PrunableBert(nn.Module):
             n_keep = max(1, int(round(scores.numel() * capacity)))
             keep = set(torch.topk(scores, n_keep).indices.tolist())
             heads_to_prune[l] = [h for h in range(scores.numel()) if h not in keep]
+            prune_attention_heads(self.bert.encoder.layer[l], keep)
 
             f_scores = self.ffn_scores(l)
             f_keep = max(1, int(round(f_scores.numel() * capacity)))
             self.prune_ffn(l, torch.topk(f_scores, f_keep).indices)
-        for l, heads in heads_to_prune.items():
-            self.bert.encoder.layer[l].attention.prune_heads(heads)
         self.pruned_heads = heads_to_prune
         self.capacity = float(capacity)
 
@@ -165,8 +180,10 @@ def load_bert(path: Union[str, Path], device: Optional[torch.device] = None) -> 
         if size != model.bert.encoder.layer[l].intermediate.dense.out_features:
             model.prune_ffn(l, torch.arange(size))
     if heads:
-        for l, h_list in heads.items():
-            model.bert.encoder.layer[l].attention.prune_heads(h_list)
+        orig_heads = model.bert.config.num_attention_heads
+        for l, h_pruned in heads.items():
+            keep = [h for h in range(orig_heads) if h not in h_pruned]
+            prune_attention_heads(model.bert.encoder.layer[l], keep)
     model.pruned_heads = heads
     model.capacity = float(s["capacity"])
     state = torch.load(path / "model.pt", map_location="cpu", weights_only=True)

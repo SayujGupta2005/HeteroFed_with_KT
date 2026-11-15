@@ -242,6 +242,7 @@ class Config:
             fd_reliability_prior=float(data.get("fd_reliability_prior", 5.0)),
             fd_use_loss_term=bool(data.get("fd_use_loss_term", False)),
             local_holdout_size=int(data.get("local_holdout_size", 200)),
+            dataset_name=str(data.get("dataset_name", "dair-ai/emotion")),
             bert_model_name=str(data.get("bert_model_name", "bert-base-uncased")),
             client_capacities=[float(x) for x in data.get("client_capacities", [0.25, 0.25, 0.5, 0.75, 1.0])],
             dirichlet_alpha=float(data.get("dirichlet_alpha", 0.5)),
