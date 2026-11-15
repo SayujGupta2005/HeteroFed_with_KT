@@ -763,13 +763,25 @@ AG_NEWS_LABELS: List[str] = ["World", "Sports", "Business", "Sci/Tech"]
 
 def _load_emotion_split(config: Config, split: str) -> Dataset:
     d_name = getattr(config, "dataset_name", "dair-ai/emotion")
-    if d_name.lower() in {"ag_news", "agnews"}:
-        d_name = "ag_news"
-    try:
-        ds = load_dataset(d_name, split=split, token=config.hf_token)
-    except Exception:
-        ds = load_dataset(d_name, split=split)
-    return ds.select_columns(["text", "label"])
+    candidates = [d_name]
+    if d_name.lower() in {"ag_news", "agnews", "fancyzhx/ag_news"}:
+        candidates = ["fancyzhx/ag_news", "ag_news"]
+
+    last_err = None
+    for name in candidates:
+        try:
+            ds = load_dataset(name, split=split, token=config.hf_token)
+            return ds.select_columns(["text", "label"])
+        except Exception as e:
+            last_err = e
+            try:
+                ds = load_dataset(name, split=split)
+                return ds.select_columns(["text", "label"])
+            except Exception as e2:
+                last_err = e2
+                continue
+    if last_err is not None:
+        raise last_err
 
 
 def dirichlet_partition(

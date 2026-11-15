@@ -1,5 +1,5 @@
 mode: "data_free_fd"
-dataset_name: "ag_news"
+dataset_name: "fancyzhx/ag_news"
 num_classes: 4
 
 num_clients: 5
