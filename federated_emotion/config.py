@@ -128,6 +128,7 @@ class Config:
     #: hard-coded 50 (~8 examples per class over 6 classes) was far too small to read.
     local_holdout_size: int = 200
 
+    dataset_name: str = "dair-ai/emotion"
     bert_model_name: str = "bert-base-uncased"
     client_capacities: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.5, 0.75, 1.0])
     dirichlet_alpha: float = 0.5

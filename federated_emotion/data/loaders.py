@@ -758,11 +758,17 @@ def compute_class_counts(
     return counts
 
 
+AG_NEWS_LABELS: List[str] = ["World", "Sports", "Business", "Sci/Tech"]
+
+
 def _load_emotion_split(config: Config, split: str) -> Dataset:
+    d_name = getattr(config, "dataset_name", "dair-ai/emotion")
+    if d_name.lower() in {"ag_news", "agnews"}:
+        d_name = "ag_news"
     try:
-        ds = load_dataset("dair-ai/emotion", split=split, token=config.hf_token)
+        ds = load_dataset(d_name, split=split, token=config.hf_token)
     except Exception:
-        ds = load_dataset("dair-ai/emotion", split=split)
+        ds = load_dataset(d_name, split=split)
     return ds.select_columns(["text", "label"])
 
 
@@ -817,6 +823,7 @@ def load_emotion_partitions(
 # ---------------------------------------------------------------------------
 __all__ = [
     "CANONICAL_LABELS",
+    "AG_NEWS_LABELS",
     "LABEL_TO_ID",
     "ID_TO_LABEL",
     "NUM_CLASSES",

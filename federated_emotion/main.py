@@ -19,7 +19,7 @@ import torch
 
 from federated_emotion.client import client_label, run_client_round
 from federated_emotion.config import Config, load_config
-from federated_emotion.data.loaders import CANONICAL_LABELS, compute_class_counts, load_emotion_partitions
+from federated_emotion.data.loaders import AG_NEWS_LABELS, CANONICAL_LABELS, compute_class_counts, load_emotion_partitions
 from federated_emotion.datafree import (
     aggregate_class_payloads,
     payload_from_serializable,
@@ -137,11 +137,12 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
 
     metric_tracker = MetricTracker(log_dir=str(log_path))
 
-    print("[1/3] Partitioning dair-ai/emotion across clients (Dirichlet non-IID)...")
+    d_name = getattr(config, "dataset_name", "dair-ai/emotion")
+    print(f"[1/3] Partitioning {d_name} across clients (Dirichlet non-IID)...")
     global_profiler.start("Server_Load_Data")
     partitions, global_test = load_emotion_partitions(config, client_ids)
     global_profiler.stop("Server_Load_Data")
-    dataset_name = f"dair-ai/emotion (dir a={config.dirichlet_alpha})"
+    dataset_name = f"{d_name} (dir a={config.dirichlet_alpha})"
 
     train_sets: Dict[int, Any] = {}
     holdouts: Dict[int, Any] = {}
@@ -157,10 +158,11 @@ def run_pipeline(config: Config, resume: bool = False) -> None:
         label = client_label(cid, config)
         cross_eval[f"Holdout [Client {cid:02d}: {label}]"] = holdouts[cid]
         client_lines.append(f"Client {cid:02d} | {label:<26} | train {len(train_sets[cid]):<5} | holdout {n_hold}")
-    cross_eval["Global test [dair-ai/emotion]"] = global_test
+    cross_eval[f"Global test [{d_name}]"] = global_test
 
+    class_names = AG_NEWS_LABELS if "ag_news" in d_name.lower() or "agnews" in d_name.lower() else CANONICAL_LABELS
     print("\n  Class coverage (train slices):")
-    print("    " + f"{'client':<8}" + "".join(f"{c:>10}" for c in CANONICAL_LABELS[: config.num_classes]))
+    print("    " + f"{'client':<8}" + "".join(f"{c:>10}" for c in class_names[: config.num_classes]))
     for cid in client_ids:
         print("    " + f"{cid:<8}" + "".join(f"{int(n):>10}" for n in counts[cid]))
     print(f"  Global test set: {len(global_test)} examples\n")

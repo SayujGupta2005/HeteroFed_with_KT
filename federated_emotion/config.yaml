@@ -12,7 +12,7 @@ learning_rate: 2e-5
 weight_decay: 0.01
 
 bert_model_name: "bert-base-uncased"
-client_capacities: [0.25, 0.25, 0.5, 0.75, 1.0]   # encoder keep ratio per client, same order as active_client_ids
+client_capacities: [0.25, 0.25, 0.5, 0.75, 1.0]  
 
 dirichlet_alpha: 0.5
 min_client_samples: 100

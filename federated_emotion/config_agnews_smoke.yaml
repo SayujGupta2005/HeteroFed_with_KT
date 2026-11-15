@@ -1,0 +1,34 @@
+mode: "data_free_fd"
+dataset_name: "ag_news"
+num_classes: 4
+
+num_clients: 5
+active_client_ids: [1, 2, 3, 4, 5]
+
+num_rounds: 2
+local_epochs: 1
+batch_size_train: 8
+batch_size_infer: 32
+max_seq_length: 64
+learning_rate: 2e-5
+
+bert_model_name: "bert-base-uncased"
+client_capacities: [0.25, 0.25, 0.5, 0.75, 1.0]
+
+dirichlet_alpha: 0.5
+min_client_samples: 50
+private_dataset_max_size: 200
+local_holdout_size: 40
+test_set_size: 200
+
+kd_warmup_rounds: 1
+fd_temperature: 2.0
+
+fcfd_positions: [4, 8, 12]
+fcfd_num_paths: 2
+
+seed_base: 42
+checkpoint_dir: "./checkpoints_agnews_smoke"
+log_dir: "./logs_agnews_smoke"
+hf_token_env_var: "HF_TOKEN"
+
