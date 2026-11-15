@@ -114,7 +114,8 @@ class PrunableBert(nn.Module):
             f_scores = self.ffn_scores(l)
             f_keep = max(1, int(round(f_scores.numel() * capacity)))
             self.prune_ffn(l, torch.topk(f_scores, f_keep).indices)
-        self.bert.prune_heads(heads_to_prune)
+        for l, heads in heads_to_prune.items():
+            self.bert.encoder.layer[l].attention.prune_heads(heads)
         self.pruned_heads = heads_to_prune
         self.capacity = float(capacity)
 
@@ -164,7 +165,8 @@ def load_bert(path: Union[str, Path], device: Optional[torch.device] = None) -> 
         if size != model.bert.encoder.layer[l].intermediate.dense.out_features:
             model.prune_ffn(l, torch.arange(size))
     if heads:
-        model.bert.prune_heads(heads)
+        for l, h_list in heads.items():
+            model.bert.encoder.layer[l].attention.prune_heads(h_list)
     model.pruned_heads = heads
     model.capacity = float(s["capacity"])
     state = torch.load(path / "model.pt", map_location="cpu", weights_only=True)
