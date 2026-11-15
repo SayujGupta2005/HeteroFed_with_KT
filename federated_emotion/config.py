@@ -30,17 +30,7 @@ REQUIRED_CONFIG_FIELDS: Set[str] = {
     "batch_size_infer",
     "max_seq_length",
     "learning_rate",
-    "lora_rank",
-    "lora_alpha",
-    "lora_dropout",
-    "quant_bits",
-    "kd_lambda",
     "kd_warmup_rounds",
-    "kd_temperature",
-    "aggregation_mode",
-    "aggregation_temperature",
-    "public_kd_pool_size",
-    "public_eval_holdout_size",
     "private_dataset_max_size",
     "seed_base",
     "checkpoint_dir",
@@ -78,21 +68,21 @@ class Config:
     batch_size_infer: int
     max_seq_length: int
     learning_rate: float
-    lora_rank: int
-    lora_alpha: int
-    lora_dropout: float
-    quant_bits: int
-    kd_lambda: float
     kd_warmup_rounds: int
-    kd_temperature: float
-    aggregation_mode: str
-    aggregation_temperature: float
-    public_kd_pool_size: int
-    public_eval_holdout_size: int
     seed_base: int
     checkpoint_dir: str
     log_dir: str
     hf_token_env_var: str
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    quant_bits: int = 0
+    kd_lambda: float = 0.5
+    kd_temperature: float = 2.0
+    aggregation_mode: str = "accuracy_weighted"
+    aggregation_temperature: float = 1.0
+    public_kd_pool_size: int = 500
+    public_eval_holdout_size: int = 200
     private_dataset_max_size: int = 2000
     active_client_ids: Optional[List[int]] = None
     num_classes: int = 6
@@ -137,6 +127,18 @@ class Config:
     #: dataset. In data_free_fd mode this is the ONLY evaluation set a client has, so the old
     #: hard-coded 50 (~8 examples per class over 6 classes) was far too small to read.
     local_holdout_size: int = 200
+
+    bert_model_name: str = "bert-base-uncased"
+    client_capacities: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.5, 0.75, 1.0])
+    dirichlet_alpha: float = 0.5
+    min_client_samples: int = 100
+    test_set_size: int = 2000
+    weight_decay: float = 0.01
+    fcfd_positions: List[int] = field(default_factory=lambda: [4, 8, 12])
+    fcfd_num_paths: int = 2
+    fcfd_kd_weight: float = 1.0
+    fcfd_app_weight: float = 1.0
+    fcfd_func_weight: float = 1.0
 
     @property
     def is_public_set(self) -> bool:
@@ -209,17 +211,17 @@ class Config:
             batch_size_infer=int(data["batch_size_infer"]),
             max_seq_length=int(data["max_seq_length"]),
             learning_rate=float(data["learning_rate"]),
-            lora_rank=int(data["lora_rank"]),
-            lora_alpha=int(data["lora_alpha"]),
-            lora_dropout=float(data["lora_dropout"]),
-            quant_bits=int(data["quant_bits"]),
-            kd_lambda=float(data["kd_lambda"]),
+            lora_rank=int(data.get("lora_rank", 8)),
+            lora_alpha=int(data.get("lora_alpha", 16)),
+            lora_dropout=float(data.get("lora_dropout", 0.05)),
+            quant_bits=int(data.get("quant_bits", 0)),
+            kd_lambda=float(data.get("kd_lambda", 0.5)),
             kd_warmup_rounds=int(data["kd_warmup_rounds"]),
-            kd_temperature=float(data["kd_temperature"]),
-            aggregation_mode=str(data["aggregation_mode"]),
-            aggregation_temperature=float(data["aggregation_temperature"]),
-            public_kd_pool_size=int(data["public_kd_pool_size"]),
-            public_eval_holdout_size=int(data["public_eval_holdout_size"]),
+            kd_temperature=float(data.get("kd_temperature", 2.0)),
+            aggregation_mode=str(data.get("aggregation_mode", "accuracy_weighted")),
+            aggregation_temperature=float(data.get("aggregation_temperature", 1.0)),
+            public_kd_pool_size=int(data.get("public_kd_pool_size", 500)),
+            public_eval_holdout_size=int(data.get("public_eval_holdout_size", 200)),
             private_dataset_max_size=int(data.get("private_dataset_max_size", 2000)),
             seed_base=int(data["seed_base"]),
             checkpoint_dir=str(data["checkpoint_dir"]),
@@ -239,6 +241,17 @@ class Config:
             fd_reliability_prior=float(data.get("fd_reliability_prior", 5.0)),
             fd_use_loss_term=bool(data.get("fd_use_loss_term", False)),
             local_holdout_size=int(data.get("local_holdout_size", 200)),
+            bert_model_name=str(data.get("bert_model_name", "bert-base-uncased")),
+            client_capacities=[float(x) for x in data.get("client_capacities", [0.25, 0.25, 0.5, 0.75, 1.0])],
+            dirichlet_alpha=float(data.get("dirichlet_alpha", 0.5)),
+            min_client_samples=int(data.get("min_client_samples", 100)),
+            test_set_size=int(data.get("test_set_size", 2000)),
+            weight_decay=float(data.get("weight_decay", 0.01)),
+            fcfd_positions=[int(x) for x in data.get("fcfd_positions", [4, 8, 12])],
+            fcfd_num_paths=int(data.get("fcfd_num_paths", 2)),
+            fcfd_kd_weight=float(data.get("fcfd_kd_weight", 1.0)),
+            fcfd_app_weight=float(data.get("fcfd_app_weight", 1.0)),
+            fcfd_func_weight=float(data.get("fcfd_func_weight", 1.0)),
         )
 
     @classmethod

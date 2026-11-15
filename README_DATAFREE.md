@@ -1,5 +1,8 @@
 # Data-Free Federated Distillation (`mode: data_free_fd`)
 
+> On branch `feature/pruned-bert-fcfd` the LLM roster below is replaced by one global BERT pruned
+> into 25/25/50/75/100% clients, distilled with FCFD. See [`README_PRUNED_BERT_FCFD.md`](README_PRUNED_BERT_FCFD.md).
+
 Heterogeneous federated learning across five 3–4B LLM clients **with no shared corpus of any
 kind**. Clients exchange one averaged logit vector per class they hold — roughly 144 bytes per
 client per round — and are evaluated on their own held-out slices.

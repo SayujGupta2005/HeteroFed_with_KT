@@ -1,10 +1,11 @@
 torch
 transformers
-peft
-bitsandbytes
-accelerate
 datasets
 scikit-learn
 pyyaml
 tqdm
-sentencepiece
+numpy
+# optional, only for the legacy LLM wrapper in models/wrapper.py
+peft
+bitsandbytes
+accelerate

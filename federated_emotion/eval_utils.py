@@ -31,7 +31,11 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 
 from federated_emotion.config import Config
 from federated_emotion.data.loaders import CLIENT_DATASETS
-from federated_emotion.models.wrapper import CLIENT_MODELS, get_model_for_client
+try:
+    from federated_emotion.models.wrapper import get_model_for_client
+except ImportError:
+    def get_model_for_client(client_id: int) -> str:
+        return f"client_{client_id}"
 
 logger = logging.getLogger(__name__)
 
@@ -292,10 +296,11 @@ def summarize_run(
     summary_csv_rows: List[Dict[str, Any]] = []
 
     for cid in sorted_clients:
-        model_id = get_model_for_client(cid)
+        first_rec = next(iter(client_round_data[cid].values()), {})
+        model_id = first_rec.get("model_id") or get_model_for_client(cid)
         model_short = model_id.split("/")[-1]
         ds_info = CLIENT_DATASETS.get(cid, ("Unknown", None))
-        ds_name = f"{ds_info[0]}" + (f" ({ds_info[1]})" if ds_info[1] else "")
+        ds_name = first_rec.get("dataset_name") or (f"{ds_info[0]}" + (f" ({ds_info[1]})" if ds_info[1] else ""))
         ds_name_trunc = (ds_name[:21] + "..") if len(ds_name) > 24 else ds_name
 
         acc_strs = []

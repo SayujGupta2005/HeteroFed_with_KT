@@ -758,6 +758,60 @@ def compute_class_counts(
     return counts
 
 
+def _load_emotion_split(config: Config, split: str) -> Dataset:
+    try:
+        ds = load_dataset("dair-ai/emotion", split=split, token=config.hf_token)
+    except Exception:
+        ds = load_dataset("dair-ai/emotion", split=split)
+    return ds.select_columns(["text", "label"])
+
+
+def dirichlet_partition(
+    labels: np.ndarray,
+    num_clients: int,
+    alpha: float,
+    min_size: int,
+    seed: int,
+    max_tries: int = 100,
+) -> List[np.ndarray]:
+    rng = np.random.default_rng(seed)
+    classes = np.unique(labels)
+    for _ in range(max_tries):
+        parts: List[List[int]] = [[] for _ in range(num_clients)]
+        for c in classes:
+            idx = rng.permutation(np.where(labels == c)[0])
+            props = rng.dirichlet(np.full(num_clients, alpha))
+            cuts = (np.cumsum(props) * len(idx)).astype(int)[:-1]
+            for k, chunk in enumerate(np.split(idx, cuts)):
+                parts[k].extend(chunk.tolist())
+        if min(len(p) for p in parts) >= min_size:
+            break
+    return [rng.permutation(np.asarray(p, dtype=np.int64)) for p in parts]
+
+
+def load_emotion_partitions(
+    config: Config,
+    client_ids: List[int],
+) -> Tuple[Dict[int, Dataset], Dataset]:
+    train = _load_emotion_split(config, "train")
+    test = _load_emotion_split(config, "test")
+    labels = np.asarray(train["label"], dtype=np.int64)
+    parts = dirichlet_partition(
+        labels,
+        len(client_ids),
+        config.dirichlet_alpha,
+        config.min_client_samples,
+        config.seed_base,
+    )
+    out: Dict[int, Dataset] = {}
+    for cid, idx in zip(client_ids, parts):
+        idx = idx[: config.private_dataset_max_size]
+        out[cid] = train.select(idx.tolist())
+    if config.test_set_size and config.test_set_size < len(test):
+        test = test.shuffle(seed=config.seed_base).select(range(config.test_set_size))
+    return out, test
+
+
 # ---------------------------------------------------------------------------
 # 8. Package Exports
 # ---------------------------------------------------------------------------
@@ -773,4 +827,6 @@ __all__ = [
     "load_public_dataset",
     "load_private_dataset",
     "compute_class_counts",
+    "dirichlet_partition",
+    "load_emotion_partitions",
 ]

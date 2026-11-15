@@ -363,6 +363,66 @@ def logits_from_serializable(data: Optional[Dict[str, List[float]]]) -> Optional
     return {int(k): np.asarray(v, dtype=np.float32) for k, v in data.items()}
 
 
+def collect_class_features(
+    pooled: Sequence[torch.Tensor],
+    labels: torch.Tensor,
+    positions: Sequence[int],
+    store: Dict[int, Dict[int, List[torch.Tensor]]],
+) -> None:
+    lab = labels.detach().cpu().tolist()
+    for k in positions:
+        feats = pooled[k].detach().float().cpu()
+        bucket = store.setdefault(int(k), defaultdict(list))
+        for i, yy in enumerate(lab):
+            bucket[int(yy)].append(feats[i])
+
+
+def average_class_features(
+    store: Dict[int, Dict[int, List[torch.Tensor]]],
+) -> Dict[int, Dict[int, np.ndarray]]:
+    return {int(k): average_class_logits(per_class) for k, per_class in store.items()}
+
+
+def aggregate_class_payloads(
+    payloads: Sequence[Optional[Dict[str, object]]],
+    positions: Sequence[int],
+    **kwargs,
+) -> Optional[Dict[str, object]]:
+    logits = aggregate_class_logits([p.get("logits") if p else None for p in payloads], **kwargs)
+    if logits is None:
+        return None
+    quiet = dict(kwargs, verbose=False)
+    features: Dict[int, Dict[int, np.ndarray]] = {}
+    for k in positions:
+        per_client = [(p.get("features") or {}).get(int(k)) if p else None for p in payloads]
+        agg = aggregate_class_logits(per_client, **quiet)
+        if agg is not None:
+            features[int(k)] = agg
+    return {"logits": logits, "features": features}
+
+
+def payload_to_serializable(payload: Optional[Dict[str, object]]) -> Dict[str, object]:
+    if not payload:
+        return {}
+    return {
+        "logits": logits_to_serializable(payload.get("logits")),
+        "features": {
+            str(k): logits_to_serializable(v) for k, v in (payload.get("features") or {}).items()
+        },
+    }
+
+
+def payload_from_serializable(data: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if not data or not data.get("logits"):
+        return None
+    return {
+        "logits": logits_from_serializable(data["logits"]),
+        "features": {
+            int(k): logits_from_serializable(v) for k, v in (data.get("features") or {}).items()
+        },
+    }
+
+
 __all__ = [
     "collect_class_logits",
     "average_class_logits",
@@ -373,4 +433,9 @@ __all__ = [
     "distillation_loss",
     "logits_to_serializable",
     "logits_from_serializable",
+    "collect_class_features",
+    "average_class_features",
+    "aggregate_class_payloads",
+    "payload_to_serializable",
+    "payload_from_serializable",
 ]

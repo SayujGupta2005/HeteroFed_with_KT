@@ -1,99 +1,39 @@
-# config.yaml
-#
-# mode selects which federation approach runs. Everything under the other mode's header is
-# ignored, so one file drives both.
-#
-#   public_set    Clients exchange soft labels over a shared public transfer pool
-#                 (dair-ai/emotion). FedMD / FedDF / DS-FL lineage. Uses kd_*,
-#                 aggregation_* and public_* settings.
-#
-#   data_free_fd  No shared corpus at all. Clients exchange one averaged logit vector per
-#                 class they hold (FedDistill, Jeong et al. 2018, arXiv:1811.11479), and are
-#                 scored on their own held-out slices. Uses fd_* settings.
-#                 Upload is num_classes^2 floats per client per round -- 144 bytes for 6
-#                 classes. Only one forward pass per training step, versus two in public_set.
 mode: "data_free_fd"
 
-# ---------------------------------------------------------------------------
-# clients
-# ---------------------------------------------------------------------------
-# Five 3-4B backbones across three architecture families, one loaded at a time.
-#   1 Phi-3.5-mini-instruct    <- go_emotions (simplified)
-#   2 Qwen2.5-3B-Instruct      <- tweet_eval (emotion)
-#   3 Phi-3-mini-4k-instruct   <- sem_eval_2018_task1 (subtask5.english)
-#   4 Qwen2.5-3B               <- xed_en_fi (en_annotated)
-#   5 Qwen1.5-4B-Chat          <- emotion (dair-ai)
-#
-# Clients 4 and 5 replace the old silicone entries, whose HF loaders no longer work; they
-# previously "loaded" only because DATASET_ALIASES redirected them to mteb/emotion, i.e. the
-# evaluation corpus. dair-ai/emotion is legitimate as a client dataset here because
-# data_free_fd loads no public pool -- and it is the only source carrying all six canonical
-# labels, which lifts 'love' from one usable holder to two.
 num_clients: 5
 active_client_ids: [1, 2, 3, 4, 5]
 
-num_rounds: 5
-local_epochs: 3
-batch_size_train: 8
-batch_size_infer: 16
+num_rounds: 10
+local_epochs: 2
+batch_size_train: 16
+batch_size_infer: 64
 max_seq_length: 128
-learning_rate: 2e-4
+learning_rate: 2e-5
+weight_decay: 0.01
 
-# ---------------------------------------------------------------------------
-# model / adapter
-# ---------------------------------------------------------------------------
-quant_bits: 4                    # real NF4. Values other than 4 or 8 disable quantization
-                                 # entirely, which is what "16-bit NF4" in earlier manifests
-                                 # actually meant.
-lora_rank: 8
-lora_alpha: 16
-lora_dropout: 0.05
-optimizer_8bit: true             # bitsandbytes 8-bit AdamW; frees VRAM for a larger batch
+bert_model_name: "bert-base-uncased"
+client_capacities: [0.25, 0.25, 0.5, 0.75, 1.0]   # encoder keep ratio per client, same order as active_client_ids
 
-sparse_training:
-  enabled: false                 # when true, reduced_rank overrides lora_rank for ALL clients
-  reduced_rank: 2
+dirichlet_alpha: 0.5
+min_client_samples: 100
+private_dataset_max_size: 4000
+local_holdout_size: 200
+test_set_size: 2000
 
-# ---------------------------------------------------------------------------
-# mode: data_free_fd  -- per-class logits only, no shared corpus
-# ---------------------------------------------------------------------------
-fd_lambda: 1.0                   # weight of the per-class logit distillation term
-fd_temperature: 2.0              # softmax temperature for that term
-fd_weight_by_count: true         # weight client k's class-c logit by its class-c example
-                                 # count. false reproduces the reference unweighted mean, in
-                                 # which sem_eval's 13 'love' examples carry the same vote as
-                                 # go_emotions' 475.
+kd_warmup_rounds: 1
+fd_temperature: 2.0
+fd_weight_by_count: true
+fd_count_exponent: 1.0
+fd_use_reliability: true
+fd_reliability_exponent: 1.0
+fd_reliability_prior: 5.0
+fd_use_loss_term: false
 
-# Reliability-weighted aggregation.
-#   w_k^c  proportional to  (n_k^c ** fd_count_exponent) * (r_k^c ** fd_reliability_exponent)
-# r_k^c is shrunk per-class accuracy on client's own holdout. Measures competence against
-# ground truth, not consensus. Separates clients with equal counts but different accuracy.
-fd_count_exponent: 1.0           # 1.0=raw, 0.5=sqrt damping, 0.0=ignored
-fd_use_reliability: true         # false = pure count weighting
-fd_reliability_exponent: 1.0     # 0.0 disables it
-fd_reliability_prior: 5.0        # Empirical-Bayes pseudo-count; prevents accidental 0/1
-                                 # accuracy for rare classes.
-fd_use_loss_term: false          # 1/(1+per-class FD loss). CAUTION: self-reinforcing;
-                                 # use for ablation only.
-
-# ---------------------------------------------------------------------------
-# mode: public_set  -- shared public transfer pool
-# ---------------------------------------------------------------------------
-kd_lambda: 0.5
-kd_temperature: 2.0
-aggregation_mode: "accuracy_weighted"   # or "uniform"
-aggregation_temperature: 1.0
-public_kd_pool_size: 500
-public_eval_holdout_size: 200
-
-# ---------------------------------------------------------------------------
-# shared
-# ---------------------------------------------------------------------------
-kd_warmup_rounds: 1              # rounds trained purely locally before distillation starts.
-                                 # Round 1 is therefore a free local-only reference point.
-local_holdout_size: 200          # per-client held-out slice; the only eval set in data-free
-                                 # mode, so it must be large enough to read (was 50).
-private_dataset_max_size: 2000   # cap per client, before the holdout is carved off
+fcfd_positions: [4, 8, 12]
+fcfd_num_paths: 2
+fcfd_kd_weight: 1.0
+fcfd_app_weight: 1.0
+fcfd_func_weight: 1.0
 
 seed_base: 42
 checkpoint_dir: "./checkpoints"
