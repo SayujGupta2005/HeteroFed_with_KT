@@ -166,8 +166,14 @@ def save_bert(model: PrunableBert, path: Union[str, Path], extra: Optional[Dict[
     with open(path / "structure.json", "w", encoding="utf-8") as f:
         json.dump(model.structure(), f, indent=2)
     torch.save(model.state_dict(), path / "model.pt")
+    extra_path = path / "extra.pt"
     if extra:
-        torch.save(extra, path / "extra.pt")
+        torch.save(extra, extra_path)
+    elif extra_path.exists():
+        try:
+            extra_path.unlink()
+        except OSError:
+            pass
 
 
 def load_bert(path: Union[str, Path], device: Optional[torch.device] = None) -> PrunableBert:

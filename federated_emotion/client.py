@@ -118,8 +118,14 @@ def run_client_round(
         model = load_bert(prev_dir, device)
         fcfd = build_fcfd(model, config).to(device)
         extra = load_extra(prev_dir)
-        if extra is not None:
-            fcfd.load_state_dict(extra)
+        if extra is not None and len(fcfd.positions) > 0:
+            current_state = fcfd.state_dict()
+            matching_state = {
+                k: v for k, v in extra.items()
+                if k in current_state and v.shape == current_state[k].shape
+            }
+            if matching_state:
+                fcfd.load_state_dict(matching_state, strict=False)
         print(f"  -> Loaded {prev_dir} ({model.describe()})")
 
         tokenizer = get_bert_tokenizer(config.bert_model_name)
