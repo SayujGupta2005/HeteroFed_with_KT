@@ -642,6 +642,8 @@ def main() -> None:
                 results_dir=cell_dir,
             )
             all_summaries.append(summary)
+            # Progressively write summary CSVs so results are visible immediately
+            _write_ablation_csvs(all_summaries, ablation_root)
         except Exception as exc:
             logger.exception(f"Cell {cell_label} failed: {exc}")
             all_summaries.append({
@@ -650,6 +652,7 @@ def main() -> None:
                 "attacker_pct": attacker_pct,
                 "error": str(exc),
             })
+            _write_ablation_csvs(all_summaries, ablation_root)
 
         # Clear VRAM between cells
         _clear_gpu_memory()
